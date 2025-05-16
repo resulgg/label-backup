@@ -1,0 +1,60 @@
+# Go build artifacts
+# These are executables and other build outputs
+label-backup
+label-backup.exe
+*.out
+
+# Test binaries
+# Executables generated from `go test -c`
+*.test
+
+# IDE / Editor specific folders and files
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
+*.komodoproject
+*.komodoedit
+
+# OS specific files
+# These are system files that often appear in directories
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Log files
+# Any files with .log extension, and rotated logs like app.log.1
+*.log
+*.log.*
+
+# Local data and backup directories
+# These might be created during local testing or development runs
+# Add any other local data directories you might use
+backups/
+label-backup-data/
+my-local-backups/ # As used in the example docker-compose in README.md
+
+# Go module vendor directory
+# Usually, you don't commit the vendor directory if you're using Go modules,
+# as `go.mod` and `go.sum` define the dependencies.
+vendor/
+
+# Environment files
+# These often contain sensitive credentials or local configurations
+.env
+.env.*
+# It's common to commit example env files, so un-ignore them if you use them
+!/.env.example
+
+# Coverage reports and profiles
+coverage.out
+coverage.html
+profile.out
+
+# Any local configuration files not meant for the repository
+# e.g., local.conf, config.local.yaml, etc.
+local.conf
+config.local.json
+config.local.yaml
+
+# If you create any other temporary build files or directories, add them here.

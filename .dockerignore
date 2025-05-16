@@ -1,0 +1,42 @@
+# Git specific
+.git
+.gitignore
+
+# Docker specific - these are not needed inside the image itself
+# Dockerfile is used to build, not included in the image layers via COPY .
+Dockerfile 
+# docker-compose.yml is for orchestration, not part of the application image
+docker-compose.yml 
+docker-compose-test.yml
+cover-image.png
+# Go build artifacts (though multi-stage build handles this well for the final image)
+# If you run `go build` locally, the output binary shouldn't be copied.
+label-backup
+label-backup.exe 
+*.out
+
+# IDE / Editor specific
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
+
+# OS specific
+.DS_Store
+Thumbs.db
+
+# Log files
+*.log
+
+# Local data directories if they were ever in the build context
+# (currently they are one level up, so this is just for safety)
+backups/
+label-backup-data/
+
+# Documentation files not needed in the final running image
+README.md
+LICENSE.txt # Assuming LICENSE is LICENSE.txt, adjust if it's just LICENSE
+LICENSE
+
+# Go module vendor directory (if you were to use it)
+vendor/ 

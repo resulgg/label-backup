@@ -1,0 +1,155 @@
+version: "3.8"
+
+services:
+  label-backup:
+    image: resulgg/label-backup
+    container_name: label_backup
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - backups_data:/backups
+    environment:
+      - LOG_LEVEL=debug
+      - GLOBAL_RETENTION_PERIOD=1d
+      - GC_DRY_RUN=false
+      - LOCAL_BACKUP_PATH=/backups
+      - RECONCILE_INTERVAL_SECONDS=10
+      - BUCKET_NAME="test-bucket"
+      - REGION="us-east-1"
+      - ENDPOINT="http://minio:9000"
+      - ACCESS_KEY_ID="minioadmin"
+      - SECRET_ACCESS_KEY="minioadmin"
+      - S3_USE_PATH_STYLE=true
+      # Webhook Configuration
+      # - WEBHOOK_URL=your-webhook-url
+      # - WEBHOOK_SECRET=your-webhook-secret
+      # - WEBHOOK_TIMEOUT_SECONDS=10
+      # - WEBHOOK_MAX_RETRIES=3
+    depends_on: # Ensure MinIO is attempted to start before label-backup
+      minio:
+        condition: service_healthy
+    networks:
+      - backup_network
+
+  minio:
+    image: minio/minio:latest
+    container_name: minio_s3_server
+    restart: unless-stopped
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    environment:
+      - MINIO_ROOT_USER=minioadmin
+      - MINIO_ROOT_PASSWORD=minioadmin
+      # - MINIO_DEFAULT_BUCKETS=test-bucket # Optional: create bucket on start. label-backup will create it if not exists.
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 5
+    networks:
+      - backup_network
+
+  test-db:
+    image: postgres:15
+    container_name: test_postgres_db
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=testuser
+      - POSTGRES_PASSWORD=testpass
+      - POSTGRES_DB=testdb
+    volumes:
+      - postgres_data_vol:/var/lib/postgresql/data
+    labels:
+      - "backup.enabled=true"
+      - "backup.type=postgres"
+      - "backup.cron=*/1 * * * *"
+      - "backup.conn=postgresql://testuser:testpass@test-db:5432/testdb?sslmode=disable"
+      - "backup.database=testdb"
+      - "backup.dest=remote"
+      - "backup.retention=6h"
+      - "backup.prefix=test-db-backup"
+    networks:
+      - backup_network
+
+  test-mongo-db:
+    image: mongo:latest
+    container_name: test_mongo_db
+    restart: unless-stopped
+    environment:
+      - MONGO_INITDB_ROOT_USERNAME=testmongouser
+      - MONGO_INITDB_ROOT_PASSWORD=testmongopass
+      - MONGO_INITDB_DATABASE=testmongodb
+    volumes:
+      - mongo_data_vol:/data/db
+    labels:
+      - "backup.enabled=true"
+      - "backup.type=mongodb"
+      - "backup.cron=0 */1 * * * *"
+      - "backup.conn=mongodb://testmongouser:testmongopass@test-mongo-db:27017/testmongodb?authSource=admin"
+      - "backup.database=testmongodb"
+      - "backup.dest=remote"
+      - "backup.retention=6h"
+      - "backup.prefix=test-mongo-backup"
+    networks:
+      - backup_network
+
+  test-mysql-db:
+    image: mysql:8.0
+    container_name: test_mysql_db
+    restart: unless-stopped
+    environment:
+      - MYSQL_ROOT_PASSWORD=testmysqlrootpass
+      - MYSQL_DATABASE=testmysqldb
+      - MYSQL_USER=testmysqluser
+      - MYSQL_PASSWORD=testmysqlpass
+    command: ["mysqld", "--default-authentication-plugin=mysql_native_password"]
+    volumes:
+      - mysql_data_vol:/var/lib/mysql
+    labels:
+      - "backup.enabled=true"
+      - "backup.type=mysql"
+      - "backup.cron=0 */1 * * * *"
+      - "backup.conn=mysql://testmysqluser:testmysqlpass@test-mysql-db:3306/testmysqldb?sslmode=disabled"
+      - "backup.database=testmysqldb"
+      - "backup.dest=remote"
+      - "backup.retention=6h"
+      - "backup.prefix=test-mysql-backup"
+    networks:
+      - backup_network
+
+  test-redis-db:
+    image: redis:latest
+    container_name: test_redis_db
+    restart: unless-stopped
+    command: redis-server --requirepass testredispass
+    volumes:
+      - redis_data_vol:/data
+    labels:
+      - "backup.enabled=true"
+      - "backup.type=redis"
+      - "backup.cron=0 */1 * * * *"
+      - "backup.conn=redis://:testredispass@test-redis-db:6379/0"
+      - "backup.database=0"
+      - "backup.dest=remote"
+      - "backup.retention=6h"
+      - "backup.prefix=test-redis-backup"
+    networks:
+      - backup_network
+
+networks:
+  backup_network:
+    driver: bridge
+
+volumes:
+  backups_data: {}
+  postgres_data_vol: {}
+  mongo_data_vol: {}
+  mysql_data_vol: {}
+  redis_data_vol: {}
+  minio_data: {}
