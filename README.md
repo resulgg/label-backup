@@ -21,7 +21,7 @@ It runs as a side-car or standalone container in your Docker environment, monito
 
 ## Quick Start with Docker Compose
 
-Refer to the `docker-compose.yml` in this repository for a comprehensive example of how to run the Label Backup agent alongside your database services (it no longer references `docker-compose.example.yml` as that was deleted).
+Refer to the `docker-compose-test.yml` in this repository for a comprehensive example of how to run the Label Backup agent alongside your database services.
 
 **Key steps:**
 
