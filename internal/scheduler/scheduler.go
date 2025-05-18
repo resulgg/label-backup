@@ -304,20 +304,3 @@ func (s *Scheduler) GetActiveJobsCount() int {
 	defer s.mu.Unlock()
 	return len(s.activeJobs)
 }
-
-// Ensure imports for io, time, sync are present if not automatically added
-// They seem to be used, so should be fine.
-// "io"
-// "time"
-// "sync"
-
-// Add placeholder for S3Writer.GetObjectURL and LocalWriter.GetFullPath if they don't exist
-// For S3Writer:
-// func (s *S3Writer) GetObjectURL(key string) (string, error) {
-//    return fmt.Sprintf("s3://%s/%s", s.bucket, key), nil // Simplified
-// }
-// For LocalWriter:
-// func (lw *LocalWriter) GetFullPath(objectName string) string {
-//    return filepath.Join(lw.basePath, objectName) // Simplified
-// }
-// These should be implemented in the respective writer files.

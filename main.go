@@ -6,8 +6,6 @@ import (
 	"strconv"
 	"strings"
 
-	// "log" // Standard log import will be removed if all instances are gone
-
 	"net/http"
 	"os"
 	"os/signal" // Added for sync.Once
@@ -203,31 +201,25 @@ func runGlobalGC(ctx context.Context, discoveryWatcher *discovery.Watcher, write
 }
 
 func main() {
-	// Initial log to stdout before Zap is fully initialized via blank import
-	// fmt.Println("Label Backup Agent starting...") // Keep or remove, logger.Log below is preferred once logger is up.
-
-	// Zap will be initialized by the blank import _ "label-backup/internal/logger"
-	logger.Log.Info("Label Backup Agent starting...") // Moved from comment to active log line.
+	logger.Log.Info("Label Backup Agent starting...")
 
 	globalCfgForWriterAndOthers := loadGlobalConfig()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	discoveryWatcher, err := discovery.NewWatcher() // Assuming NewWatcher will be updated to use Zap
+	discoveryWatcher, err := discovery.NewWatcher() 
 	if err != nil {
 		logger.Log.Fatal("Failed to initialize discovery watcher", zap.Error(err))
 	}
 
-	webhookSender := webhook.NewSender(globalCfgForWriterAndOthers) // Assuming NewSender will be updated to use Zap
+	webhookSender := webhook.NewSender(globalCfgForWriterAndOthers) 
 	defer webhookSender.Stop()
 
-	sched := scheduler.NewScheduler(globalCfgForWriterAndOthers, webhookSender, discoveryWatcher) // Assuming NewScheduler uses Zap
+	sched := scheduler.NewScheduler(globalCfgForWriterAndOthers, webhookSender, discoveryWatcher) 
 	defer sched.Stop()
 
-	// --- Setup Nightly GC Cron Job ---
-	// Use Zap for cron's internal logger
-	gcCron := cron.New(cron.WithLogger(logger.NewCronZapLogger(logger.Log.Named("gc-cron")))) // Use custom CronZapLogger
+	gcCron := cron.New(cron.WithLogger(logger.NewCronZapLogger(logger.Log.Named("gc-cron")))) 
 	_, err = gcCron.AddFunc("0 4 * * *", func() { 
 		gcCtx, gcCancel := context.WithTimeout(context.Background(), 1*time.Hour) 
 		defer gcCancel()
@@ -244,11 +236,9 @@ func main() {
 	    <-gcCronCtx.Done()
 	    logger.Log.Info("GC cron scheduler stopped.")
 	}()
-	// --- End GC Cron Job Setup ---
 
-	go discoveryWatcher.Start(ctx) // Assuming Start method will be updated to use Zap
+	go discoveryWatcher.Start(ctx) 
 
-	// HTTP Server Setup
 	hmux := http.NewServeMux()
 	hmux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -256,14 +246,9 @@ func main() {
 		logger.Log.Debug("Health check successful", zap.String("path", r.URL.Path))
 	})
 
-	// Remove Prometheus handler
-	// hmux.Handle("/metrics", promhttp.Handler())
-	// logger.Log.Info("Serving Prometheus metrics on /metrics")
-
 	go func() {
 		logger.Log.Info("Serving HTTP endpoints on :8080", zap.String("addr", ":8080"))
 		if err := http.ListenAndServe(":8080", hmux); err != nil {
-			// http.ErrServerClosed is expected on graceful shutdown, so don't log as fatal.
 			if err != http.ErrServerClosed {
 				logger.Log.Error("HTTP server failed", zap.Error(err))
 			} else {
