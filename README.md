@@ -201,11 +201,11 @@ Add these labels to your database containers:
 
 #### Example Labels
 
-    ```yaml
+```yaml
 
 labels:
 backup.enabled: "true"
-backup.cron: "0 2 \* \* \*" # Daily at 2 AM
+backup.cron: "0 2 * * *" # Daily at 2 AM
 backup.type: "postgres"
 backup.conn: "postgresql://user:pass@host:5432/db"
 backup.dest: "remote"
