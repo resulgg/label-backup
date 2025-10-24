@@ -1,0 +1,50 @@
+version: "3.8"
+
+services:
+  minio:
+    image: minio/minio:latest
+    environment:
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+
+  mongodb:
+    image: mongo:7
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: admin
+      MONGO_INITDB_ROOT_PASSWORD: adminpass
+    labels:
+      backup.enabled: "true"
+      backup.cron: "0 1 * * *"
+      backup.type: "mongodb"
+      backup.conn: "mongodb://admin:adminpass@mongodb:27017/admin"
+      backup.database: "myapp"
+      backup.dest: "s3"
+      backup.prefix: "mongodb-backups"
+      backup.retention: "7d"
+
+  label-backup:
+    image: resulgg/label-backup
+    environment:
+      BUCKET_NAME: "backups"
+      REGION: "us-east-1"
+      ACCESS_KEY_ID: "minioadmin"
+      SECRET_ACCESS_KEY: "minioadmin"
+      ENDPOINT: "http://minio:9000"
+      GLOBAL_RETENTION_PERIOD: "30d"
+      LOG_LEVEL: "info"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on:
+      - minio
+      - mongodb
+    ports:
+      - "8080:8080"
+
+volumes:
+  minio-data:

@@ -1,0 +1,82 @@
+version: "3.8"
+
+services:
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_DB: appdb
+      POSTGRES_USER: appuser
+      POSTGRES_PASSWORD: apppass
+    labels:
+      backup.enabled: "true"
+      backup.cron: "0 2 * * *"
+      backup.type: "postgres"
+      backup.conn: "postgresql://appuser:apppass@postgres:5432/appdb"
+      backup.dest: "s3"
+      backup.prefix: "app/postgres"
+      backup.retention: "14d"
+
+  mysql:
+    image: mysql:8.0
+    environment:
+      MYSQL_DATABASE: analytics
+      MYSQL_USER: analytics
+      MYSQL_PASSWORD: analyticspass
+      MYSQL_ROOT_PASSWORD: rootpass
+    labels:
+      backup.enabled: "true"
+      backup.cron: "0 4 * * *"
+      backup.type: "mysql"
+      backup.conn: "mysql://analytics:analyticspass@mysql:3306/analytics"
+      backup.dest: "s3"
+      backup.prefix: "analytics/mysql"
+      backup.retention: "30d"
+
+  mongodb:
+    image: mongo:7
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: admin
+      MONGO_INITDB_ROOT_PASSWORD: adminpass
+    labels:
+      backup.enabled: "true"
+      backup.cron: "0 1 * * *"
+      backup.type: "mongodb"
+      backup.conn: "mongodb://admin:adminpass@mongodb:27017/admin"
+      backup.database: "myapp"
+      backup.dest: "s3"
+      backup.prefix: "app/mongodb"
+      backup.retention: "7d"
+
+  redis:
+    image: redis:7
+    labels:
+      backup.enabled: "true"
+      backup.cron: "0 */6 * * *"
+      backup.type: "redis"
+      backup.dest: "local"
+      backup.prefix: "cache/redis"
+      backup.retention: "3d"
+
+  label-backup:
+    image: resulgg/label-backup
+    environment:
+      BUCKET_NAME: "production-backups"
+      REGION: "us-east-1"
+      ACCESS_KEY_ID: "your-access-key"
+      SECRET_ACCESS_KEY: "your-secret-key"
+      LOCAL_BACKUP_PATH: "/backups"
+      GLOBAL_RETENTION_PERIOD: "90d"
+      CONCURRENT_BACKUP_LIMIT: "2"
+      WEBHOOK_URL: "https://hooks.slack.com/services/your/webhook/url"
+      WEBHOOK_SECRET: "your-webhook-secret"
+      LOG_LEVEL: "info"
+    volumes:
+      - ./backups:/backups
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on:
+      - postgres
+      - mysql
+      - mongodb
+      - redis
+    ports:
+      - "8080:8080"

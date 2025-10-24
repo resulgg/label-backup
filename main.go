@@ -2,40 +2,40 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
 
 	"net/http"
 	"os"
-	"os/signal" // Added for sync.Once
+	"os/signal"
 	"syscall"
 	"time"
 
 	"label-backup/internal/discovery"
 	"label-backup/internal/gc"
-	"label-backup/internal/logger" // Import custom logger
+	"label-backup/internal/logger"
+	"label-backup/internal/model"
 	"label-backup/internal/scheduler"
 	"label-backup/internal/webhook"
 	"label-backup/internal/writer"
 
 	"github.com/robfig/cron/v3"
-	"go.uber.org/zap" // For direct use for zap.String etc.
+	"go.uber.org/zap"
 )
 
 const (
 	DefaultReconcileIntervalSeconds = 10
 	EnvReconcileIntervalSeconds   = "RECONCILE_INTERVAL_SECONDS"
 	EnvGlobalRetentionPeriod      = "GLOBAL_RETENTION_PERIOD"
-	DefaultGlobalRetentionPeriod  = "7d" // Default global retention: 7 days
+	DefaultGlobalRetentionPeriod  = "7d" 
 	EnvGCDryRun                   = "GC_DRY_RUN"
 )
 
-var globalRetentionPeriod time.Duration // Parsed global retention period
-var gcDryRun bool                     // Parsed GC dry run flag
+var globalRetentionPeriod time.Duration 
+var gcDryRun bool                     
 
-// parseRetentionPeriod parses a string like "7d", "24h", "30m", or a plain number (for days)
-// into a time.Duration. Uses a default if the string is empty or invalid.
 func parseRetentionPeriod(retentionStr string, defaultValue string) time.Duration {
 	value := strings.TrimSpace(retentionStr)
 	if value == "" {
@@ -49,7 +49,6 @@ func parseRetentionPeriod(retentionStr string, defaultValue string) time.Duratio
 				zap.String("value", value),
 				zap.String("default", defaultValue),
 			)
-			// Fallback to parse default again
 			d, _ = time.ParseDuration(defaultValue)
 			return d
 		}
@@ -65,7 +64,7 @@ func parseRetentionPeriod(retentionStr string, defaultValue string) time.Duratio
 					zap.String("value", value),
 					zap.String("default", defaultValue),
 				)
-				d, _ = time.ParseDuration(defaultValue) // Assumes default is always valid
+				d, _ = time.ParseDuration(defaultValue) 
 				return d
 			}
 			return time.Duration(days) * 24 * time.Hour
@@ -88,23 +87,20 @@ func parseRetentionPeriod(retentionStr string, defaultValue string) time.Duratio
 	logger.Log.Warn("Invalid global retention period format, using default.",
 		zap.String("value", value),
 		zap.String("default", defaultValue),
-		zap.Error(err), // Original time.ParseDuration error
+		zap.Error(err), 
 	)
-	d, _ = time.ParseDuration(defaultValue) // Assumes default is always valid
+	d, _ = time.ParseDuration(defaultValue) 
 	return d
 }
 
-// loadGlobalConfig loads configuration from environment variables.
 func loadGlobalConfig() map[string]string {
 	cfg := make(map[string]string)
 
-	// Helper function to get and trim quotes from env var
 	getTrimmedEnv := func(key string) string {
 		val := os.Getenv(key)
 		return strings.Trim(val, "\\\"")
 	}
 
-	// S3 Configuration
 	if s3Bucket := getTrimmedEnv("BUCKET_NAME"); s3Bucket != "" {
 		cfg[writer.GlobalConfigKeyS3Bucket] = s3Bucket
 		logger.Log.Info("Using S3 bucket from env", zap.String("bucket", s3Bucket))
@@ -119,46 +115,37 @@ func loadGlobalConfig() map[string]string {
 		cfg[writer.GlobalConfigKeyS3Endpoint] = s3Endpoint
 		logger.Log.Info("Using S3 endpoint from env", zap.String("endpoint", s3Endpoint))
 	}
-	// AWS SDK v2 uses specific environment variables for credentials by default (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY).
-	// However, to allow overriding them with potentially different names if the user desires (as per this request),
-	// we'll read them explicitly and store them under our defined keys.
-	// The S3 writer will then need to be adapted to use these from the config map if present.
 	if accessKeyID := getTrimmedEnv("ACCESS_KEY_ID"); accessKeyID != "" {
 		cfg[writer.GlobalConfigKeyS3AccessKeyID] = accessKeyID
-		logger.Log.Info("Using S3 access key ID from env") // Don't log the key itself
+		logger.Log.Info("Using S3 access key ID from env") 
 	}
 	if secretAccessKey := getTrimmedEnv("SECRET_ACCESS_KEY"); secretAccessKey != "" {
 		cfg[writer.GlobalConfigKeyS3SecretAccessKey] = secretAccessKey
-		logger.Log.Info("Using S3 secret access key from env") // Don't log the secret
+		logger.Log.Info("Using S3 secret access key from env") 
 	}
 
-	// Local Writer Configuration
 	if localPath := getTrimmedEnv("LOCAL_BACKUP_PATH"); localPath != "" {
 		cfg[writer.GlobalConfigKeyLocalPath] = localPath
 		logger.Log.Info("Using local backup path from env", zap.String("path", localPath))
 	} else {
-		cfg[writer.GlobalConfigKeyLocalPath] = writer.DefaultLocalPath // Use default from writer pkg
+		cfg[writer.GlobalConfigKeyLocalPath] = writer.DefaultLocalPath 
 		logger.Log.Info("LOCAL_BACKUP_PATH not set, using default", zap.String("path", writer.DefaultLocalPath))
 	}
 
-	// Global Retention Period
 	retentionPeriodStr := os.Getenv(EnvGlobalRetentionPeriod)
 	globalRetentionPeriod = parseRetentionPeriod(retentionPeriodStr, DefaultGlobalRetentionPeriod)
 	logger.Log.Info("Using global retention period", zap.Duration("period", globalRetentionPeriod))
 
-	// GC Dry Run
 	dryRunStr := strings.ToLower(os.Getenv(EnvGCDryRun))
 	gcDryRun = (dryRunStr == "true" || dryRunStr == "1")
 	logger.Log.Info("GC Dry Run mode", zap.Bool("enabled", gcDryRun))
 
-	// Add other global configurations here (e.g., webhook URLs, retention days if global)
 	return cfg
 }
 
-// runGlobalGC iterates through all known backup specs and runs GC for each.
 func runGlobalGC(ctx context.Context, discoveryWatcher *discovery.Watcher, writerCfg map[string]string, retentionPeriodForGC time.Duration, isDryRun bool) {
 	logger.Log.Info("Starting nightly global Garbage Collection run...")
-	activeSpecs := discoveryWatcher.GetRegistry() // Get a snapshot of current specs
+	activeSpecs := discoveryWatcher.GetRegistry() 
 
 	if len(activeSpecs) == 0 {
 		logger.Log.Info("Global GC: No active backup specifications found. Nothing to GC.")
@@ -189,7 +176,6 @@ func runGlobalGC(ctx context.Context, discoveryWatcher *discovery.Watcher, write
 		}
 
 		if err := gcRunner.RunGC(ctx); err != nil {
-			// Errors from RunGC itself are already logged within it, but we can log a summary error here.
 			logger.Log.Error("Global GC: Error during GC run for spec", 
 			    zap.String("containerID", containerID), 
 			    zap.String("prefix", spec.Prefix), 
@@ -200,10 +186,57 @@ func runGlobalGC(ctx context.Context, discoveryWatcher *discovery.Watcher, write
 	logger.Log.Info("Nightly global Garbage Collection run finished.")
 }
 
+
+func checkDiskSpace(path string) error {
+	return writer.CheckDiskSpace(path)
+}
+
+func validateConfig(globalConfig map[string]string) error {
+	var errors []string
+
+	if cronExpr, ok := globalConfig["GLOBAL_CRON"]; ok && cronExpr != "" {
+		if _, err := cron.ParseStandard(cronExpr); err != nil {
+			errors = append(errors, fmt.Sprintf("Invalid GLOBAL_CRON expression '%s': %v", cronExpr, err))
+		}
+	}
+
+	if retentionStr, ok := globalConfig["GLOBAL_RETENTION"]; ok && retentionStr != "" {
+		if duration := parseRetentionPeriod(retentionStr, ""); duration == 0 && retentionStr != "" {
+			errors = append(errors, fmt.Sprintf("Invalid GLOBAL_RETENTION '%s': cannot parse duration", retentionStr))
+		}
+	}
+
+	if limitStr, ok := globalConfig["CONCURRENT_BACKUP_LIMIT"]; ok && limitStr != "" {
+		if limit, err := strconv.Atoi(limitStr); err != nil || limit <= 0 {
+			errors = append(errors, fmt.Sprintf("Invalid CONCURRENT_BACKUP_LIMIT '%s': must be a positive integer", limitStr))
+		}
+	}
+
+	if bucket, ok := globalConfig["BUCKET_NAME"]; ok && bucket != "" {
+		logger.Log.Debug("S3 bucket configuration validated", zap.String("bucket", bucket))
+	}
+
+	if localPath, ok := globalConfig["LOCAL_BACKUP_PATH"]; ok && localPath != "" {
+		logger.Log.Debug("Local backup path configuration validated", zap.String("path", localPath))
+	}
+
+	if len(errors) > 0 {
+		return fmt.Errorf("configuration validation failed:\n%s", strings.Join(errors, "\n"))
+	}
+
+	logger.Log.Info("Configuration validation successful")
+	return nil
+}
+
 func main() {
 	logger.Log.Info("Label Backup Agent starting...")
+	defer logger.Close() 
 
 	globalCfgForWriterAndOthers := loadGlobalConfig()
+
+	if err := validateConfig(globalCfgForWriterAndOthers); err != nil {
+		logger.Log.Fatal("Configuration validation failed", zap.Error(err))
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -212,12 +245,11 @@ func main() {
 	if err != nil {
 		logger.Log.Fatal("Failed to initialize discovery watcher", zap.Error(err))
 	}
+	defer discoveryWatcher.Close() 
 
 	webhookSender := webhook.NewSender(globalCfgForWriterAndOthers) 
-	defer webhookSender.Stop()
 
 	sched := scheduler.NewScheduler(globalCfgForWriterAndOthers, webhookSender, discoveryWatcher) 
-	defer sched.Stop()
 
 	gcCron := cron.New(cron.WithLogger(logger.NewCronZapLogger(logger.Log.Named("gc-cron")))) 
 	_, err = gcCron.AddFunc("0 4 * * *", func() { 
@@ -246,9 +278,120 @@ func main() {
 		logger.Log.Debug("Health check successful", zap.String("path", r.URL.Path))
 	})
 
+	hmux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		defer cancel()
+
+		var checks []string
+		var allHealthy bool = true
+
+		if err := discoveryWatcher.TestDockerConnection(ctx); err != nil {
+			checks = append(checks, fmt.Sprintf("Docker: %v", err))
+			allHealthy = false
+		} else {
+			checks = append(checks, "Docker: OK")
+		}
+
+		if err := checkDiskSpace("/backups"); err != nil {
+			checks = append(checks, fmt.Sprintf("Disk: %v", err))
+			allHealthy = false
+		} else {
+			checks = append(checks, "Disk: OK")
+		}
+
+		if bucket, ok := globalCfgForWriterAndOthers["BUCKET_NAME"]; ok && bucket != "" {
+			checks = append(checks, "S3: OK")
+		}
+
+		if allHealthy {
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprintf(w, "ready\n%s", strings.Join(checks, "\n"))
+		} else {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			fmt.Fprintf(w, "not ready\n%s", strings.Join(checks, "\n"))
+		}
+	})
+
+	hmux.HandleFunc("/metadata", func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+		defer cancel()
+
+		// Get query parameters
+		objectName := r.URL.Query().Get("object")
+		if objectName == "" {
+			http.Error(w, "object parameter is required", http.StatusBadRequest)
+			return
+		}
+
+		// Get writer for the first available container (for testing)
+		registry := discoveryWatcher.GetRegistry()
+		if len(registry) == 0 {
+			http.Error(w, "no containers found", http.StatusNotFound)
+			return
+		}
+
+		// Use the first container's spec to get writer
+		var firstSpec model.BackupSpec
+		for _, spec := range registry {
+			firstSpec = spec
+			break
+		}
+
+		backupWriter, err := writer.GetWriter(firstSpec, globalCfgForWriterAndOthers)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("failed to get writer: %v", err), http.StatusInternalServerError)
+			return
+		}
+
+		// Read metadata
+		metadata, err := writer.ReadMetadata(ctx, backupWriter, objectName)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("failed to read metadata: %v", err), http.StatusNotFound)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(metadata)
+	})
+
+	hmux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
+		_, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+		defer cancel()
+
+		registry := discoveryWatcher.GetRegistry()
+		
+		status := map[string]interface{}{
+			"timestamp": time.Now().UTC().Format(time.RFC3339),
+			"active_jobs": len(registry),
+			"containers": make([]map[string]interface{}, 0),
+		}
+
+		for containerID, spec := range registry {
+			containerInfo := map[string]interface{}{
+				"container_id":   containerID,
+				"container_name": spec.ContainerName,
+				"database_type":  spec.Type,
+				"database_name":  spec.Database,
+				"cron_schedule":  spec.Cron,
+				"destination":    spec.Dest,
+				"retention":      spec.Retention.String(),
+			}
+			status["containers"] = append(status["containers"].([]map[string]interface{}), containerInfo)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(status)
+	})
+
+	server := &http.Server{
+		Addr:    ":8080",
+		Handler: hmux,
+	}
+
 	go func() {
 		logger.Log.Info("Serving HTTP endpoints on :8080", zap.String("addr", ":8080"))
-		if err := http.ListenAndServe(":8080", hmux); err != nil {
+		if err := server.ListenAndServe(); err != nil {
 			if err != http.ErrServerClosed {
 				logger.Log.Error("HTTP server failed", zap.Error(err))
 			} else {
@@ -257,12 +400,23 @@ func main() {
 		}
 	}()
 
+	defer func() {
+		logger.Log.Info("Shutting down HTTP server...")
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer shutdownCancel()
+		
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			logger.Log.Error("HTTP server shutdown failed", zap.Error(err))
+		} else {
+			logger.Log.Info("HTTP server shutdown completed")
+		}
+	}()
+
 	logger.Log.Info("Discovery watcher and scheduler started. Monitoring containers...")
 
 	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 
-	// Configure reconcile interval
 	reconcileInterval := DefaultReconcileIntervalSeconds
 	if intervalStr := os.Getenv(EnvReconcileIntervalSeconds); intervalStr != "" {
 		if intervalSec, errConv := strconv.Atoi(intervalStr); errConv == nil && intervalSec > 0 {
@@ -294,19 +448,59 @@ Loop:
 						logger.Log.Error("Error scheduling job for container", zap.String("containerID", id), zap.Error(err))
 					}
 				} else {
-					sched.RemoveJob(id) // removeJob should also log with Zap
+					sched.RemoveJob(id) 
 				}
 			}
 
-		case <-sigChan:
+		case sig := <-sigChan:
+			switch sig {
+			case syscall.SIGHUP:
+				logger.Log.Info("Received SIGHUP, reloading configuration...")
+				newConfig := loadGlobalConfig()
+				if err := validateConfig(newConfig); err != nil {
+					logger.Log.Error("Configuration validation failed during reload", zap.Error(err))
+				} else {
+					logger.Log.Info("Configuration reloaded successfully")
+					
+					globalCfgForWriterAndOthers = newConfig
+					
+					retentionPeriodStr := os.Getenv(EnvGlobalRetentionPeriod)
+					globalRetentionPeriod = parseRetentionPeriod(retentionPeriodStr, DefaultGlobalRetentionPeriod)
+					
+					dryRunStr := strings.ToLower(os.Getenv(EnvGCDryRun))
+					gcDryRun = (dryRunStr == "true" || dryRunStr == "1")
+					
+					logger.Log.Info("Global configuration updated",
+						zap.Duration("retentionPeriod", globalRetentionPeriod),
+						zap.Bool("gcDryRun", gcDryRun),
+					)
+					
+					logger.Log.Info("Updating components with new configuration...")
+					
+					webhookSender.Stop()
+					
+					sched.Stop()
+					
+					webhookSender = webhook.NewSender(newConfig)
+					
+					sched = scheduler.NewScheduler(newConfig, webhookSender, discoveryWatcher)
+					
+					logger.Log.Info("Components updated successfully with new configuration")
+				}
+				continue
+			case syscall.SIGINT, syscall.SIGTERM:
 			logger.Log.Info("Shutdown signal received, stopping agent...")
 			cancel()
 			break Loop
+			}
 		case <-ctx.Done():
 			logger.Log.Info("Context cancelled, stopping agent...")
 			break Loop
 		}
 	}
 
+	logger.Log.Info("Cleaning up components...")
+	webhookSender.Stop()
+	sched.Stop()
 	logger.Log.Info("Label Backup Agent stopped.")
 } 

@@ -2,9 +2,12 @@ version: "3.8"
 
 services:
   label-backup:
-    image: resulgg/label-backup
+    build:
+      context: ..
+      dockerfile: Dockerfile
     container_name: label_backup
     restart: unless-stopped
+    user: "0:0" # Run as root for Docker socket access
     ports:
       - "8080:8080"
     volumes:
@@ -16,20 +19,25 @@ services:
       - GC_DRY_RUN=false
       - LOCAL_BACKUP_PATH=/backups
       - RECONCILE_INTERVAL_SECONDS=10
-      - BUCKET_NAME="test-bucket"
-      - REGION="us-east-1"
-      - ENDPOINT="http://minio:9000"
-      - ACCESS_KEY_ID="minioadmin"
-      - SECRET_ACCESS_KEY="minioadmin"
+      - CONCURRENT_BACKUP_LIMIT=20
+      - BACKUP_TIMEOUT_MINUTES=1
+      # S3 Configuration
+      - BUCKET_NAME=test-bucket
+      - REGION=us-east-1
+      - ENDPOINT=http://minio:9000
+      - ACCESS_KEY_ID=minioadmin
+      - SECRET_ACCESS_KEY=minioadmin
       - S3_USE_PATH_STYLE=true
       # Webhook Configuration
-      # - WEBHOOK_URL=your-webhook-url
-      # - WEBHOOK_SECRET=your-webhook-secret
-      # - WEBHOOK_TIMEOUT_SECONDS=10
-      # - WEBHOOK_MAX_RETRIES=3
-    depends_on: # Ensure MinIO is attempted to start before label-backup
+      - WEBHOOK_URL=http://webhook-test:8080/webhook
+      - WEBHOOK_SECRET=test-webhook-secret
+      - WEBHOOK_TIMEOUT_SECONDS=10
+      - WEBHOOK_MAX_RETRIES=3
+    depends_on:
       minio:
         condition: service_healthy
+      webhook-test:
+        condition: service_started
     networks:
       - backup_network
 
@@ -45,13 +53,24 @@ services:
     environment:
       - MINIO_ROOT_USER=minioadmin
       - MINIO_ROOT_PASSWORD=minioadmin
-      # - MINIO_DEFAULT_BUCKETS=test-bucket # Optional: create bucket on start. label-backup will create it if not exists.
+      - MINIO_DEFAULT_BUCKETS=test-bucket
     command: server /data --console-address ":9001"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
       interval: 30s
       timeout: 20s
       retries: 5
+    networks:
+      - backup_network
+
+  webhook-test:
+    image: nginx:alpine
+    container_name: webhook_test_server
+    restart: unless-stopped
+    ports:
+      - "8081:8080"
+    volumes:
+      - ./test-webhook.conf:/etc/nginx/conf.d/default.conf
     networks:
       - backup_network
 
@@ -68,7 +87,7 @@ services:
     labels:
       - "backup.enabled=true"
       - "backup.type=postgres"
-      - "backup.cron=*/1 * * * *"
+      - "backup.cron=0 */1 * * * *"
       - "backup.conn=postgresql://testuser:testpass@test-db:5432/testdb?sslmode=disable"
       - "backup.database=testdb"
       - "backup.dest=remote"

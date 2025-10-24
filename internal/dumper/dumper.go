@@ -14,20 +14,16 @@ import (
 	"go.uber.org/zap"
 )
 
-// Dumper defines the interface for database-specific backup operations.
 type Dumper interface {
-	// Dump executes the database dump, writing output to the provided writer.
-	// The output should be the raw dump data, before any compression.
 	Dump(ctx context.Context, spec model.BackupSpec, writer io.Writer) error
+	
+	TestConnection(ctx context.Context, spec model.BackupSpec) error
 }
 
-// NewDumperFunc is a function type that creates a new Dumper.
-// It allows for a factory pattern to get specific dumper implementations.
 type NewDumperFunc func(spec model.BackupSpec) (Dumper, error)
 
 var dumperFactories = make(map[string]NewDumperFunc)
 
-// RegisterDumperFactory allows different dumper implementations to register themselves.
 func RegisterDumperFactory(dbType string, factory NewDumperFunc) {
 	if factory == nil {
 		logger.Log.Fatal("Dumper factory is nil", zap.String("dbType", dbType))
@@ -39,14 +35,13 @@ func RegisterDumperFactory(dbType string, factory NewDumperFunc) {
 	logger.Log.Info("Registered dumper factory", zap.String("dbType", dbType))
 }
 
-// GetDumper returns a Dumper for the given database type from the BackupSpec.
 func GetDumper(spec model.BackupSpec) (Dumper, error) {
 	factory, ok := dumperFactories[spec.Type]
 	if !ok {
 		err := fmt.Errorf("no dumper registered for database type: %s", spec.Type)
 		logger.Log.Error("Failed to get dumper: no factory registered",
 			zap.String("dbType", spec.Type),
-			zap.String("containerID", spec.ContainerID), // Assuming spec has ContainerID
+			zap.String("containerID", spec.ContainerID),
 			zap.Error(err),
 		)
 		return nil, err
@@ -54,8 +49,6 @@ func GetDumper(spec model.BackupSpec) (Dumper, error) {
 	return factory(spec)
 }
 
-// StreamAndGzip executes a command, captures its stdout, Gzips it, and writes to the destination writer.
-// It also captures stderr for logging.
 func StreamAndGzip(ctx context.Context, cmd *exec.Cmd, destWriter io.Writer) error {
 	logFields := []zap.Field{
 		zap.String("commandPath", cmd.Path),
@@ -76,7 +69,7 @@ func StreamAndGzip(ctx context.Context, cmd *exec.Cmd, destWriter io.Writer) err
 	}
 
 	gw := gzip.NewWriter(destWriter)
-	defer gw.Close() // gw.Close() also flushes
+	defer gw.Close()
 
 	if err := cmd.Start(); err != nil {
 		wrappedErr := fmt.Errorf("failed to start dump command: %s: %w", cmd.Path, err)
@@ -88,24 +81,37 @@ func StreamAndGzip(ctx context.Context, cmd *exec.Cmd, destWriter io.Writer) err
 	var copyErr error
 	var wg sync.WaitGroup
 	wg.Add(1)
-	// Goroutine to stream and Gzip stdout
+	
 	go func() {
 		defer wg.Done()
-		_, copyErr = io.Copy(gw, stdoutPipe)
-		// gw.Close() is deferred in the main function, which is generally fine.
-		// However, if io.Copy finishes, explicitly closing here ensures data is flushed
-		// before cmd.Wait() is checked, especially if stdoutPipe closes early.
-		if err := gw.Close(); err != nil {
-		    // This error might occur if gw was already closed by the defer or if there's an issue flushing.
-		    // It's logged, but copyErr or cmd.Wait() error usually take precedence.
-		    logger.Log.Warn("StreamAndGzip: error closing gzip writer in goroutine", append(logFields, zap.Error(err))...)
+		
+		buffer := make([]byte, 32*1024)
+		for {
+			select {
+			case <-ctx.Done():
+				logger.Log.Info("StreamAndGzip: Context cancelled, stopping copy", logFields...)
+				return
+			default:
+				n, err := stdoutPipe.Read(buffer)
+				if n > 0 {
+					if _, writeErr := gw.Write(buffer[:n]); writeErr != nil {
+						copyErr = writeErr
+						return
+					}
+				}
+				if err != nil {
+					if err != io.EOF {
+						copyErr = err
+					}
+					return
+				}
+			}
 		}
 	}()
 
-	// Goroutine to capture stderr
-	stderrOutput, _ := io.ReadAll(stderrPipe) // This blocks until stderrPipe is closed (by cmd.Wait)
+	stderrOutput, _ := io.ReadAll(stderrPipe)
 
-	wg.Wait() // Wait for io.Copy to finish before checking cmd.Wait() or copyErr
+	wg.Wait()
 
 	cmdErr := cmd.Wait()
 
@@ -119,8 +125,6 @@ func StreamAndGzip(ctx context.Context, cmd *exec.Cmd, destWriter io.Writer) err
 		return fmt.Errorf("dump command '%s' failed (stderr: %s): %w", cmd.Path, stderrStr, cmdErr)
 	}
 
-	// Check error from io.Copy after cmd.Wait() succeeded.
-	// This can happen if the command succeeded but writing the output failed.
 	if copyErr != nil {
 	    logger.Log.Error("StreamAndGzip: error copying stdout to gzip writer", append(logFields, zap.Error(copyErr))...)
 	    return fmt.Errorf("error copying stdout to gzip writer after command success: %w", copyErr)

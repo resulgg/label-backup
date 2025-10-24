@@ -1,6 +1,7 @@
 package dumper
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -16,33 +17,21 @@ import (
 
 const RedisDumperType = "redis"
 
-// RedisDumper implements the Dumper interface for Redis.
 type RedisDumper struct {
 	spec model.BackupSpec
 }
 
-// redisConnParams holds parsed connection details for Redis.
 type redisConnParams struct {
 	Host     string
 	Port     string
 	Password string
-	DBNum    string // Optional, redis-cli uses -n for DB number
+	DBNum    string
 }
 
-// parseRedisConn attempts to extract host, port, and password from spec.Conn.
-// spec.Conn for Redis could be:
-// - "redis://:password@host:port/dbnum"
-// - "host:port"
-// - "host" (implies default port)
-// - ":password@host:port"
-// This is a simplified parser.
 func parseRedisConn(connStr string) (*redisConnParams, error) {
-	params := &redisConnParams{Port: "6379"} // Default Redis port
+	params := &redisConnParams{Port: "6379"}
 
-	// Attempt to parse as URI first
 	if strings.HasPrefix(connStr, "redis://") {
-		// Example: redis://:mypassword@myredishost:6380/0
-		// Go's url.Parse can handle this well.
 		u, err := url.Parse(connStr)
 		if err != nil {
 			return nil, fmt.Errorf("failed to parse Redis connection URI '%s': %w", connStr, err)
@@ -60,18 +49,13 @@ func parseRedisConn(connStr string) (*redisConnParams, error) {
 			params.DBNum = strings.TrimPrefix(u.Path, "/")
 		}
 	} else {
-		// Simple host:port or host parsing, potentially with password
-		// Example: "mypassword@myredishost:6380" or "myredishost:6380" or "myredishost"
 		tempConnStr := connStr
 		if strings.Contains(tempConnStr, "@") {
 			parts := strings.SplitN(tempConnStr, "@", 2)
-			if strings.HasPrefix(parts[0], ":") { // e.g. :password@host:port
+		if strings.HasPrefix(parts[0], ":") {
 			    params.Password = strings.TrimPrefix(parts[0], ":")
-			} else { // For user:password form, though redis-cli only takes password
-			    // For simplicity, if not starting with ':', assume it is part of host or user (which we ignore for password only)
-			    // This case is ambiguous without a full URI spec, best to use redis:// URI
-			    // Or rely on spec.Password if that field existed.
-			    // For now, we only take password if it's like :password@...
+		} else {
+			params.Password = parts[0]
 			}
 			tempConnStr = parts[1]
 		}
@@ -94,7 +78,6 @@ func init() {
 	RegisterDumperFactory(RedisDumperType, NewRedisDumper)
 }
 
-// NewRedisDumper creates a new RedisDumper.
 func NewRedisDumper(spec model.BackupSpec) (Dumper, error) {
 	if spec.Type != RedisDumperType {
 		err := fmt.Errorf("invalid dumper type for redis: %s", spec.Type)
@@ -108,7 +91,6 @@ func NewRedisDumper(spec model.BackupSpec) (Dumper, error) {
 	return &RedisDumper{spec: spec}, nil
 }
 
-// Dump executes redis-cli --rdb to get an RDB dump for Redis.
 func (d *RedisDumper) Dump(ctx context.Context, spec model.BackupSpec, writer io.Writer) error {
 	params, err := parseRedisConn(spec.Conn)
 	if err != nil {
@@ -140,10 +122,9 @@ func (d *RedisDumper) Dump(ctx context.Context, spec model.BackupSpec, writer io
 
 	cmd := exec.CommandContext(ctx, "redis-cli", args...)
 
-	// Create a safe version of args for logging, masking the password.
 	safeArgsToLog := make([]string, len(args))
 	for i, arg := range args {
-		if i > 0 && args[i-1] == "-a" { // If the previous arg was -a, this one is the password.
+		if i > 0 && args[i-1] == "-a" {
 			safeArgsToLog[i] = "<password_hidden>"
 		} else {
 			safeArgsToLog[i] = arg
@@ -157,4 +138,47 @@ func (d *RedisDumper) Dump(ctx context.Context, spec model.BackupSpec, writer io
 	)
 
 	return StreamAndGzip(ctx, cmd, writer)
+} 
+
+func (d *RedisDumper) TestConnection(ctx context.Context, spec model.BackupSpec) error {
+	params, err := parseRedisConn(spec.Conn)
+	if err != nil {
+		return fmt.Errorf("failed to parse connection string: %w", err)
+	}
+
+	args := []string{}
+	if params.Host != "" {
+		args = append(args, "-h", params.Host)
+	}
+	if params.Port != "" {
+		args = append(args, "-p", params.Port)
+	}
+	if params.Password != "" {
+		args = append(args, "-a", params.Password)
+	}
+	if spec.Database != "" {
+		args = append(args, "-n", spec.Database)
+	} else if params.DBNum != "" {
+		args = append(args, "-n", params.DBNum)
+	}
+	args = append(args, "ping")
+
+	cmd := exec.CommandContext(ctx, "redis-cli", args...)
+
+	var stderrBuf bytes.Buffer
+	cmd.Stderr = &stderrBuf
+
+	logger.Log.Debug("Testing Redis connection",
+		zap.String("containerID", spec.ContainerID),
+		zap.String("host", params.Host),
+		zap.String("port", params.Port),
+		zap.String("database", spec.Database),
+	)
+
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("redis connection test failed: %w (stderr: %s)", err, stderrBuf.String())
+	}
+
+	logger.Log.Debug("Redis connection test successful", zap.String("containerID", spec.ContainerID))
+	return nil
 } 

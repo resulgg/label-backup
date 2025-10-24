@@ -1,10 +1,12 @@
 package dumper
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
 	"net/url"
+	"os"
 	"os/exec"
 	"strings"
 
@@ -16,12 +18,10 @@ import (
 
 const MySQLDumperType = "mysql"
 
-// MySQLDumper implements the Dumper interface for MySQL databases.
 type MySQLDumper struct {
 	spec model.BackupSpec
 }
 
-// mysqlConnParams holds parsed URI components for MySQL.
 type mysqlConnParams struct {
 	User     string
 	Password string
@@ -31,8 +31,6 @@ type mysqlConnParams struct {
 	SSLMode  string
 }
 
-// parseMySQLURI parses a MySQL connection URI.
-// Expected format: mysql://[user[:password]@]host[:port]/dbname[?param1=value1&...]
 func parseMySQLURI(connStr string) (*mysqlConnParams, error) {
 	params := &mysqlConnParams{}
 
@@ -49,7 +47,7 @@ func parseMySQLURI(connStr string) (*mysqlConnParams, error) {
 	if parsedURL.Port() != "" {
 		params.Port = parsedURL.Port()
 	} else {
-		params.Port = "3306" // Default MySQL port
+		params.Port = "3306"
 	}
 
 	if parsedURL.User != nil {
@@ -59,13 +57,12 @@ func parseMySQLURI(connStr string) (*mysqlConnParams, error) {
 		}
 	}
 
-	// Database name is the path component, without the leading slash.
 	if parsedURL.Path != "" {
 		params.DBName = strings.TrimPrefix(parsedURL.Path, "/")
 	}
 
 	queryParams := parsedURL.Query()
-	params.SSLMode = queryParams.Get("sslmode") // e.g. "disable"
+	params.SSLMode = queryParams.Get("sslmode")
 
 	if params.Host == "" {
 		return nil, fmt.Errorf("host missing in MySQL connection URI: %s", connStr)
@@ -77,7 +74,6 @@ func init() {
 	RegisterDumperFactory(MySQLDumperType, NewMySQLDumper)
 }
 
-// NewMySQLDumper creates a new MySQLDumper.
 func NewMySQLDumper(spec model.BackupSpec) (Dumper, error) {
 	if spec.Type != MySQLDumperType {
 		err := fmt.Errorf("invalid dumper type for mysql: %s", spec.Type)
@@ -91,7 +87,6 @@ func NewMySQLDumper(spec model.BackupSpec) (Dumper, error) {
 	return &MySQLDumper{spec: spec}, nil
 }
 
-// Dump executes mariadb-dump (provided by mysql-client in Alpine) for the MySQL database.
 func (d *MySQLDumper) Dump(ctx context.Context, spec model.BackupSpec, writer io.Writer) error {
 	params, err := parseMySQLURI(spec.Conn)
 	if err != nil {
@@ -104,9 +99,8 @@ func (d *MySQLDumper) Dump(ctx context.Context, spec model.BackupSpec, writer io
 	}
 
 	args := []string{}
-	loggedArgs := []string{} // For logging, with password masked
+	loggedArgs := []string{} 
 
-	// Connection parameters
 	if params.Host != "" {
 		args = append(args, "--host="+params.Host)
 		loggedArgs = append(loggedArgs, "--host="+params.Host)
@@ -119,12 +113,13 @@ func (d *MySQLDumper) Dump(ctx context.Context, spec model.BackupSpec, writer io
 		args = append(args, "--user="+params.User)
 		loggedArgs = append(loggedArgs, "--user="+params.User)
 	}
+
+	cmd := exec.CommandContext(ctx, "mariadb-dump", args...)
+
 	if params.Password != "" {
-		args = append(args, "--password="+params.Password)
-		loggedArgs = append(loggedArgs, "--password=***")
+		cmd.Env = append(os.Environ(), "MYSQL_PWD="+params.Password)
 	}
 
-	// Handle SSLMode for mariadb-dump
 	if strings.ToLower(params.SSLMode) == "disable" || strings.ToLower(params.SSLMode) == "disabled" {
 		args = append(args, "--ssl=0")
 		loggedArgs = append(loggedArgs, "--ssl=0")
@@ -135,17 +130,15 @@ func (d *MySQLDumper) Dump(ctx context.Context, spec model.BackupSpec, writer io
 		)
 	}
 
-	// Standard mysqldump/mariadb-dump options
 	args = append(args, "--single-transaction")
 	args = append(args, "--routines")
 	args = append(args, "--triggers")
 	args = append(args, "--skip-lock-tables")
 
-	// Determine database to dump
 	dbToDump := ""
-	if spec.Database != "" { // Explicit label takes precedence
+	if spec.Database != "" { 
 		dbToDump = spec.Database
-	} else if params.DBName != "" { // From URI path
+	} else if params.DBName != "" { 
 		dbToDump = params.DBName
 	} else {
 		err := fmt.Errorf("no database specified in URI path or backup.database label for MySQL dump")
@@ -159,8 +152,12 @@ func (d *MySQLDumper) Dump(ctx context.Context, spec model.BackupSpec, writer io
 	args = append(args, dbToDump)
 	loggedArgs = append(loggedArgs, dbToDump)
 
-	// Use mariadb-dump, as that's what mysql-client in Alpine provides
-	cmd := exec.CommandContext(ctx, "mariadb-dump", args...)
+	cmd = exec.CommandContext(ctx, "mariadb-dump", args...)
+	
+	// Set password via environment variable for security
+	if params.Password != "" {
+		cmd.Env = append(os.Environ(), "MYSQL_PWD="+params.Password)
+	}
 
 	logger.Log.Info("Executing mariadb-dump",
 		zap.String("containerID", spec.ContainerID),
@@ -171,4 +168,59 @@ func (d *MySQLDumper) Dump(ctx context.Context, spec model.BackupSpec, writer io
 	)
 
 	return StreamAndGzip(ctx, cmd, writer)
+}
+
+func (d *MySQLDumper) TestConnection(ctx context.Context, spec model.BackupSpec) error {
+	params, err := parseMySQLURI(spec.Conn)
+	if err != nil {
+		return fmt.Errorf("failed to parse connection URI: %w", err)
+	}
+
+	args := []string{}
+	if params.Host != "" {
+		args = append(args, "-h", params.Host)
+	}
+	if params.Port != "" {
+		args = append(args, "-P", params.Port)
+	}
+	if params.User != "" {
+		args = append(args, "-u", params.User)
+	}
+	
+	dbToTest := ""
+	if spec.Database != "" {
+		dbToTest = spec.Database
+	} else if params.DBName != "" {
+		dbToTest = params.DBName
+	}
+	
+	if dbToTest != "" {
+		args = append(args, dbToTest)
+	}
+	
+	args = append(args, "-e", "SELECT 1;")
+
+	cmd := exec.CommandContext(ctx, "mysql", args...)
+
+	if params.Password != "" {
+		cmd.Env = append(os.Environ(), "MYSQL_PWD="+params.Password)
+	}
+
+	var stderrBuf bytes.Buffer
+	cmd.Stderr = &stderrBuf
+
+	logger.Log.Debug("Testing MySQL connection",
+		zap.String("containerID", spec.ContainerID),
+		zap.String("host", params.Host),
+		zap.String("port", params.Port),
+		zap.String("user", params.User),
+		zap.String("database", dbToTest),
+	)
+
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("connection test failed for MySQL: %w (stderr: %s)", err, stderrBuf.String())
+	}
+
+	logger.Log.Debug("MySQL connection test successful", zap.String("containerID", spec.ContainerID))
+	return nil
 }

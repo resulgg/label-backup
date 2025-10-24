@@ -2,13 +2,15 @@ package writer
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"io"
+	"time"
 
-	"label-backup/internal/logger" // Added for Zap logger
+	"label-backup/internal/logger"
 	"label-backup/internal/model"
 
-	"go.uber.org/zap" // Added for Zap fields
+	"go.uber.org/zap"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
@@ -17,7 +19,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
 
-// countingReader wraps an io.Reader and counts the bytes read.
 type countingReader struct {
 	reader io.Reader
 	count  int64
@@ -35,7 +36,6 @@ func (cr *countingReader) BytesRead() int64 {
 
 const S3WriterType = "remote"
 
-// S3Writer implements BackupWriter for saving to AWS S3.
 type S3Writer struct {
 	uploader   *manager.Uploader
 	s3Client   *s3.Client // Keep client for other potential S3 ops, though uploader uses its own.
@@ -47,11 +47,6 @@ func init() {
 	RegisterWriterFactory(S3WriterType, NewS3Writer)
 }
 
-// NewS3Writer creates a new S3Writer.
-// It expects the S3 bucket name from globalConfig (e.g., BUCKET_NAME).
-// AWS credentials and region are expected to be configured via standard AWS SDK mechanisms
-// (env vars, shared credentials file, IAM roles), unless an ENDPOINT is provided
-// or ACCESS_KEY_ID and SECRET_ACCESS_KEY are explicitly set in the environment.
 func NewS3Writer(spec model.BackupSpec, globalConfig map[string]string) (BackupWriter, error) {
 	bucket, ok := globalConfig[GlobalConfigKeyS3Bucket]
 	if !ok || bucket == "" {
@@ -59,7 +54,7 @@ func NewS3Writer(spec model.BackupSpec, globalConfig map[string]string) (BackupW
 		return nil, fmt.Errorf("S3 bucket name not provided in global config under key '%s'", GlobalConfigKeyS3Bucket)
 	}
 
-	region := globalConfig[GlobalConfigKeyS3Region] // Can be empty, SDK will use env var or profile
+	region := globalConfig[GlobalConfigKeyS3Region]
 	s3Endpoint := globalConfig[GlobalConfigKeyS3Endpoint]
 	accessKeyID := globalConfig[GlobalConfigKeyS3AccessKeyID]
 	secretAccessKey := globalConfig[GlobalConfigKeyS3SecretAccessKey]
@@ -69,7 +64,7 @@ func NewS3Writer(spec model.BackupSpec, globalConfig map[string]string) (BackupW
 
 	if accessKeyID != "" && secretAccessKey != "" {
 		logger.Log.Info("Using static S3 credentials from environment variables")
-		staticCreds := credentials.NewStaticCredentialsProvider(accessKeyID, secretAccessKey, "") // Session token is empty
+		staticCreds := credentials.NewStaticCredentialsProvider(accessKeyID, secretAccessKey, "")
 		cfgLoadOptions = append(cfgLoadOptions, awsconfig.WithCredentialsProvider(staticCreds))
 	} else {
 		logger.Log.Info("Static S3 credentials (ACCESS_KEY_ID, SECRET_ACCESS_KEY) not fully provided, using default AWS credential chain.")
@@ -79,16 +74,13 @@ func NewS3Writer(spec model.BackupSpec, globalConfig map[string]string) (BackupW
 		logger.Log.Info("Custom S3 endpoint provided, configuring for S3-compatible service",
 			zap.String("endpoint", s3Endpoint),
 		)
-		// For S3-compatible services, region might be ignored or can be a dummy value.
-		// The endpoint resolver and path-style addressing are key.
 		customResolver := aws.EndpointResolverWithOptionsFunc(func(service, r string, options ...interface{}) (aws.Endpoint, error) {
 			if service == s3.ServiceID {
 				return aws.Endpoint{
 					URL:           s3Endpoint,
-					SigningRegion: region, // Use provided region or SDK default
+					SigningRegion: region,
 				}, nil
 			}
-			// Fallback to default resolution for other services
 			return aws.Endpoint{}, &aws.EndpointNotFoundError{}
 		})
 		cfgLoadOptions = append(cfgLoadOptions, awsconfig.WithEndpointResolverWithOptions(customResolver))
@@ -110,6 +102,28 @@ func NewS3Writer(spec model.BackupSpec, globalConfig map[string]string) (BackupW
 	}
 
 	s3Client := s3.NewFromConfig(cfg, s3ClientOpts...)
+	
+	headBucketInput := &s3.HeadBucketInput{
+		Bucket: aws.String(bucket),
+	}
+	
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	
+	if _, err := s3Client.HeadBucket(ctx, headBucketInput); err != nil {
+		logger.Log.Error("S3 bucket does not exist or is not accessible", 
+			zap.String("bucket", bucket), 
+			zap.String("region", cfg.Region),
+			zap.Error(err),
+		)
+		return nil, fmt.Errorf("S3 bucket '%s' does not exist or is not accessible: %w", bucket, err)
+	}
+	
+	logger.Log.Info("S3 bucket verified as accessible", 
+		zap.String("bucket", bucket), 
+		zap.String("region", cfg.Region),
+	)
+
 	uploader := manager.NewUploader(s3Client)
 
 	logger.Log.Info("S3Writer initialized", zap.String("bucket", bucket), zap.String("region", cfg.Region), zap.String("endpoint", s3Endpoint))
@@ -121,24 +135,25 @@ func NewS3Writer(spec model.BackupSpec, globalConfig map[string]string) (BackupW
 	}, nil
 }
 
-// Type returns the type of the writer.
 func (s3w *S3Writer) Type() string {
 	return S3WriterType
 }
 
-// Write uploads the backup data from the reader to an S3 bucket.
-func (s3w *S3Writer) Write(ctx context.Context, objectName string, reader io.Reader) (destination string, bytesWritten int64, err error) {
+func (s3w *S3Writer) Write(ctx context.Context, objectName string, reader io.Reader) (destination string, bytesWritten int64, checksum string, err error) {
 	logger.Log.Info("Uploading backup to S3",
 		zap.String("bucket", s3w.bucketName),
 		zap.String("key", objectName),
 	)
 
-	countingReader := &countingReader{reader: reader}
+	// Calculate checksum while reading
+	hash := sha256.New()
+	teeReader := io.TeeReader(reader, hash)
+	countingReader := &countingReader{reader: teeReader}
 
 	result, err := s3w.uploader.Upload(ctx, &s3.PutObjectInput{
 		Bucket: aws.String(s3w.bucketName),
 		Key:    aws.String(objectName),
-		Body:   countingReader, // Use the counting reader
+		Body:   countingReader,
 	})
 	if err != nil {
 		logger.Log.Error("Failed to upload backup to S3",
@@ -146,18 +161,20 @@ func (s3w *S3Writer) Write(ctx context.Context, objectName string, reader io.Rea
 			zap.String("key", objectName),
 			zap.Error(err),
 		)
-		return "", 0, fmt.Errorf("failed to upload backup to S3 (bucket: %s, key: %s): %w", s3w.bucketName, objectName, err)
+		return "", 0, "", fmt.Errorf("failed to upload backup to S3 (bucket: %s, key: %s): %w", s3w.bucketName, objectName, err)
 	}
 
 	bytesWritten = countingReader.BytesRead()
+	checksum = fmt.Sprintf("%x", hash.Sum(nil))
+	
 	logger.Log.Info("Successfully uploaded backup to S3",
 		zap.String("location", result.Location),
 		zap.Int64("bytesWritten", bytesWritten),
+		zap.String("checksum", checksum),
 	)
-	return result.Location, bytesWritten, nil
+	return result.Location, bytesWritten, checksum, nil
 }
 
-// ListObjects lists backup objects from the S3 bucket, matching the given prefix.
 func (s3w *S3Writer) ListObjects(ctx context.Context, prefix string) ([]BackupObjectMeta, error) {
 	var objects []BackupObjectMeta
 	logger.Log.Info("S3Writer: Listing objects", 
@@ -209,7 +226,23 @@ func (s3w *S3Writer) ListObjects(ctx context.Context, prefix string) ([]BackupOb
 	return objects, nil
 }
 
-// DeleteObject deletes an object from the S3 bucket.
+func (s3w *S3Writer) ReadObject(ctx context.Context, objectName string) (io.ReadCloser, error) {
+	logger.Log.Debug("S3Writer: Reading object", 
+		zap.String("bucket", s3w.bucketName), 
+		zap.String("key", objectName),
+	)
+
+	result, err := s3w.s3Client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(s3w.bucketName),
+		Key:    aws.String(objectName),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to get object from S3: %w", err)
+	}
+
+	return result.Body, nil
+}
+
 func (s3w *S3Writer) DeleteObject(ctx context.Context, key string) error {
 	logger.Log.Info("S3Writer: Attempting to delete S3 object", 
 	    zap.String("bucket", s3w.bucketName), 
@@ -222,8 +255,6 @@ func (s3w *S3Writer) DeleteObject(ctx context.Context, key string) error {
 	})
 
 	if err != nil {
-		// S3 does not typically error if the object doesn't exist, it just completes.
-		// However, if there's an actual access error or other issue, it will be reported.
 		logger.Log.Error("Failed to delete S3 object",
 		    zap.String("bucket", s3w.bucketName),
 		    zap.String("key", key),

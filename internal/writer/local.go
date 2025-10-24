@@ -2,6 +2,7 @@ package writer
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"io"
 	"os"
@@ -14,10 +15,12 @@ import (
 	"go.uber.org/zap"
 )
 
-const LocalWriterType = "local"
-// DefaultLocalPath and GlobalConfigKeyLocalPath are defined in writer.go
+func CheckDiskSpace(path string) error {
+	return checkDiskSpaceImpl(path)
+}
 
-// LocalWriter implements BackupWriter for saving to the local filesystem.
+const LocalWriterType = "local"
+
 type LocalWriter struct {
 	basePath string
 }
@@ -26,13 +29,17 @@ func init() {
 	RegisterWriterFactory(LocalWriterType, NewLocalWriter)
 }
 
-// NewLocalWriter creates a new LocalWriter.
-// It expects a base path from globalConfig (e.g., "LOCAL_BACKUP_PATH") or defaults to "/backups".
 func NewLocalWriter(spec model.BackupSpec, globalConfig map[string]string) (BackupWriter, error) {
 	basePath := DefaultLocalPath
 	if configuredPath, ok := globalConfig[GlobalConfigKeyLocalPath]; ok && configuredPath != "" {
 		basePath = configuredPath
 	}
+	
+	if err := CheckDiskSpace(basePath); err != nil {
+		logger.Log.Error("Insufficient disk space for local backups", zap.String("path", basePath), zap.Error(err))
+		return nil, fmt.Errorf("disk space check failed: %w", err)
+	}
+	
 	if err := os.MkdirAll(basePath, 0755); err != nil {
 		logger.Log.Error("Failed to create local backup base path", zap.String("path", basePath), zap.Error(err))
 		return nil, fmt.Errorf("failed to create local backup base path %s: %w", basePath, err)
@@ -41,40 +48,36 @@ func NewLocalWriter(spec model.BackupSpec, globalConfig map[string]string) (Back
 	return &LocalWriter{basePath: basePath}, nil
 }
 
-// Type returns the type of the writer.
 func (lw *LocalWriter) Type() string {
 	return LocalWriterType
 }
 
-// Write saves the backup data from the reader to a local file.
-// objectName is used to construct the final file path relative to the basePath.
-func (lw *LocalWriter) Write(ctx context.Context, objectName string, reader io.Reader) (destination string, bytesWritten int64, err error) {
-	// Clean the objectName to prevent path traversal issues with Join alone.
-	// Replace backslashes for consistency and remove leading/trailing slashes and dots.
-	// This is a basic sanitization; more robust library might be used for production.
+func (lw *LocalWriter) Write(ctx context.Context, objectName string, reader io.Reader) (destination string, bytesWritten int64, checksum string, err error) {
+	if err := CheckDiskSpace(lw.basePath); err != nil {
+		return "", 0, "", fmt.Errorf("disk space check failed before write: %w", err)
+	}
+
 	cleanedObjectName := strings.ReplaceAll(objectName, "\\", "/")
-	cleanedObjectName = filepath.Clean(cleanedObjectName) // Resolves "..", multiple slashes etc.
-	// Prevent writing to absolute paths or paths starting with "../" after cleaning.
+	cleanedObjectName = filepath.Clean(cleanedObjectName)
 	if filepath.IsAbs(cleanedObjectName) || strings.HasPrefix(cleanedObjectName, "..") {
 		logger.Log.Error("LocalWriter: Malformed objectName, potential path traversal",
 			zap.String("originalObjectName", objectName),
 			zap.String("cleanedObjectName", cleanedObjectName),
 		)
-		return "", 0, fmt.Errorf("malformed objectName: %s", objectName)
+		return "", 0, "", fmt.Errorf("malformed objectName: %s", objectName)
 	}
 
 	filePath := filepath.Join(lw.basePath, cleanedObjectName)
 
-	// Security check: Ensure the final resolved path is within the basePath.
 	absBasePath, errAbsBase := filepath.Abs(lw.basePath)
 	if errAbsBase != nil {
 		logger.Log.Error("LocalWriter: Could not get absolute path for basePath", zap.String("basePath", lw.basePath), zap.Error(errAbsBase))
-		return "", 0, fmt.Errorf("could not determine absolute path for base: %w", errAbsBase)
+		return "", 0, "", fmt.Errorf("could not determine absolute path for base: %w", errAbsBase)
 	}
 	absFilePath, errAbsFile := filepath.Abs(filePath)
 	if errAbsFile != nil {
 		logger.Log.Error("LocalWriter: Could not get absolute path for filePath", zap.String("filePath", filePath), zap.Error(errAbsFile))
-		return "", 0, fmt.Errorf("could not determine absolute path for target: %w", errAbsFile)
+		return "", 0, "", fmt.Errorf("could not determine absolute path for target: %w", errAbsFile)
 	}
 
 	if !strings.HasPrefix(absFilePath, absBasePath) {
@@ -84,33 +87,43 @@ func (lw *LocalWriter) Write(ctx context.Context, objectName string, reader io.R
 			zap.String("basePath", lw.basePath),
 			zap.String("absBasePath", absBasePath),
 		)
-		return "", 0, fmt.Errorf("target filePath %s is outside basePath %s", absFilePath, absBasePath)
+		return "", 0, "", fmt.Errorf("target filePath %s is outside basePath %s", absFilePath, absBasePath)
 	}
 
 	if errMkdir := os.MkdirAll(filepath.Dir(filePath), 0755); errMkdir != nil {
 		logger.Log.Error("Failed to create directory for local backup file", zap.String("path", filePath), zap.Error(errMkdir))
-		return "", 0, fmt.Errorf("failed to create directory for local backup file %s: %w", filePath, errMkdir)
+		return "", 0, "", fmt.Errorf("failed to create directory for local backup file %s: %w", filePath, errMkdir)
 	}
 
 	file, errCreate := os.Create(filePath)
 	if errCreate != nil {
 		logger.Log.Error("Failed to create local backup file", zap.String("path", filePath), zap.Error(errCreate))
-		return "", 0, fmt.Errorf("failed to create local backup file %s: %w", filePath, errCreate)
+		return "", 0, "", fmt.Errorf("failed to create local backup file %s: %w", filePath, errCreate)
 	}
 	defer file.Close()
 
-	bytesWritten, errCopy := io.Copy(file, reader)
+	// Calculate checksum while writing
+	hash := sha256.New()
+	teeReader := io.TeeReader(reader, hash)
+	
+	bytesWritten, errCopy := io.Copy(file, teeReader)
 	if errCopy != nil {
-		os.Remove(filePath) // Attempt to remove partially written file on error
+		if removeErr := os.Remove(filePath); removeErr != nil {
+			logger.Log.Error("Failed to remove partial backup file", zap.String("path", filePath), zap.Error(removeErr))
+		}
 		logger.Log.Error("Failed to write backup data to local file", zap.String("path", filePath), zap.Error(errCopy))
-		return "", 0, fmt.Errorf("failed to write backup data to %s: %w", filePath, errCopy)
+		return "", 0, "", fmt.Errorf("failed to write backup data to %s: %w", filePath, errCopy)
 	}
 
-	logger.Log.Info("Successfully wrote to local backup", zap.Int64("bytesWritten", bytesWritten), zap.String("path", filePath))
-	return filePath, bytesWritten, nil
+	checksum = fmt.Sprintf("%x", hash.Sum(nil))
+	logger.Log.Info("Successfully wrote to local backup", 
+		zap.Int64("bytesWritten", bytesWritten), 
+		zap.String("path", filePath),
+		zap.String("checksum", checksum),
+	)
+	return filePath, bytesWritten, checksum, nil
 }
 
-// ListObjects lists backup files from the local filesystem, matching the given prefix.
 func (lw *LocalWriter) ListObjects(ctx context.Context, prefix string) ([]BackupObjectMeta, error) {
 	var objects []BackupObjectMeta
 	scanPath := lw.basePath
@@ -118,7 +131,6 @@ func (lw *LocalWriter) ListObjects(ctx context.Context, prefix string) ([]Backup
 		scanPath = filepath.Join(lw.basePath, prefix)
 	}
 
-	// Ensure scanPath is a directory and exists, otherwise return empty list or error
 	info, err := os.Stat(scanPath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -151,12 +163,7 @@ func (lw *LocalWriter) ListObjects(ctx context.Context, prefix string) ([]Backup
 			relKey = filepath.ToSlash(relKey)
 
 			if prefix != "" && !strings.HasPrefix(relKey, strings.Trim(filepath.ToSlash(prefix), "/")+"/") {
-			    // This check is tricky due to how Walk works with the starting path.
-			    // If scanPath = basePath/prefix, then relKey should naturally be prefix/filename.
-			    // This might be redundant if Walk is always inside the prefixed dir.
-			    // A simpler way is to check if path is within filepath.Join(lw.basePath, prefix)
-			    // The filepath.Walk will only iterate files under scanPath.
-			    // So, we just need to make sure we are creating the key correctly.
+				return nil
 			}
 
 			objects = append(objects, BackupObjectMeta{
@@ -179,36 +186,62 @@ func (lw *LocalWriter) ListObjects(ctx context.Context, prefix string) ([]Backup
 	return objects, nil
 }
 
-// DeleteObject deletes a file from the local filesystem.
-// The key is expected to be relative to the writer's basePath.
+func (lw *LocalWriter) ReadObject(ctx context.Context, objectName string) (io.ReadCloser, error) {
+	filePath := filepath.Join(lw.basePath, filepath.FromSlash(objectName))
+	
+	logger.Log.Debug("LocalWriter: Reading file", 
+		zap.String("filePath", filePath), 
+		zap.String("objectName", objectName),
+	)
+
+	// Security check: ensure file is within base path
+	absBasePath, errAbsBase := filepath.Abs(lw.basePath)
+	if errAbsBase != nil {
+		return nil, fmt.Errorf("failed to get absolute path for base path %s: %w", lw.basePath, errAbsBase)
+	}
+	
+	absFilePath, errAbsFile := filepath.Abs(filePath)
+	if errAbsFile != nil {
+		return nil, fmt.Errorf("failed to get absolute path for target file %s: %w", filePath, errAbsFile)
+	}
+
+	if !strings.HasPrefix(absFilePath, absBasePath) {
+		return nil, fmt.Errorf("read path %s (abs: %s) is outside base path %s (abs: %s), aborting", filePath, absFilePath, lw.basePath, absBasePath)
+	}
+
+	file, err := os.Open(filePath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open file %s: %w", filePath, err)
+	}
+
+	return file, nil
+}
+
 func (lw *LocalWriter) DeleteObject(ctx context.Context, key string) error {
 	filePath := filepath.Join(lw.basePath, filepath.FromSlash(key))
 
 	logger.Log.Info("LocalWriter: Attempting to delete local file", zap.String("filePath", filePath), zap.String("originalKey", key))
 
-	absBasePath, _ := filepath.Abs(lw.basePath)
-	absFilePath, _ := filepath.Abs(filePath)
-	// Re-check absolute path conversion as it might fail and return empty strings
-	if absBasePath == "" || absFilePath == "" {
-	    logger.Log.Error("Failed to get absolute paths for deletion check", zap.String("filePath", filePath), zap.String("basePath", lw.basePath))
-	    return fmt.Errorf("failed to get absolute paths for %s or %s", filePath, lw.basePath)
+	absBasePath, errAbsBase := filepath.Abs(lw.basePath)
+	if errAbsBase != nil {
+		logger.Log.Error("Failed to get absolute path for base path", zap.String("basePath", lw.basePath), zap.Error(errAbsBase))
+		return fmt.Errorf("failed to get absolute path for base path %s: %w", lw.basePath, errAbsBase)
+	}
+	
+	absFilePath, errAbsFile := filepath.Abs(filePath)
+	if errAbsFile != nil {
+		logger.Log.Error("Failed to get absolute path for target file", zap.String("filePath", filePath), zap.Error(errAbsFile))
+		return fmt.Errorf("failed to get absolute path for target file %s: %w", filePath, errAbsFile)
 	}
 
 	if !strings.HasPrefix(absFilePath, absBasePath) {
-		currentAbsFilePath, errPath := filepath.Abs(filePath)
-		if errPath != nil {
-		    logger.Log.Error("Could not determine absolute path for deletion target", zap.String("filePath", filePath), zap.Error(errPath))
-		    return fmt.Errorf("could not determine absolute path for %s: %w", filePath, errPath)
-		}
-		if !strings.HasPrefix(currentAbsFilePath, absBasePath) {
 		    logger.Log.Error("Delete path is outside base path, aborting", 
 		        zap.String("filePath", filePath), 
-		        zap.String("absFilePath", currentAbsFilePath), 
+			zap.String("absFilePath", absFilePath), 
 		        zap.String("basePath", lw.basePath), 
 		        zap.String("absBasePath", absBasePath),
 		    )
-		    return fmt.Errorf("delete path %s (abs: %s) is outside base path %s (abs: %s), aborting", filePath, currentAbsFilePath, lw.basePath, absBasePath)
-		}
+		return fmt.Errorf("delete path %s (abs: %s) is outside base path %s (abs: %s), aborting", filePath, absFilePath, lw.basePath, absBasePath)
 	}
 
 	errDel := os.Remove(filePath)

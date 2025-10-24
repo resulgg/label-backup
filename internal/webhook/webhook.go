@@ -16,27 +16,104 @@ import (
 	"time"
 
 	"label-backup/internal/logger"
-	"label-backup/internal/model" // For BackupSpec to get webhook URL and container info
+	"label-backup/internal/model"
 
 	"go.uber.org/zap"
 )
 
-const GlobalConfigKeyWebhookURL = "WEBHOOK_URL"             // Global default webhook URL
-const GlobalConfigKeyWebhookSecret = "WEBHOOK_SECRET"         // Global secret for HMAC signing
-const GlobalConfigKeyWebhookTimeout = "WEBHOOK_TIMEOUT_SECONDS" // Global timeout for webhook HTTP request
-const GlobalConfigKeyWebhookMaxRetries = "WEBHOOK_MAX_RETRIES" // Global max retries for webhook
+const GlobalConfigKeyWebhookURL = "WEBHOOK_URL"
+const GlobalConfigKeyWebhookSecret = "WEBHOOK_SECRET"
+const GlobalConfigKeyWebhookTimeout = "WEBHOOK_TIMEOUT_SECONDS"
+const GlobalConfigKeyWebhookMaxRetries = "WEBHOOK_MAX_RETRIES"
 const DefaultWebhookTimeoutSeconds = 10
 const DefaultWebhookMaxRetries = 3
 const HMACHeaderName = "X-LabelBackup-Signature-SHA256"
 
-// WebhookSender defines the interface for sending webhooks.
-// This allows for easier testing and potential alternative implementations.
+type CircuitBreakerState int
+
+const (
+	CircuitClosed CircuitBreakerState = iota
+	CircuitOpen
+	CircuitHalfOpen
+)
+
+type CircuitBreaker struct {
+	mu                sync.RWMutex
+	state             CircuitBreakerState
+	failureCount      int
+	lastFailureTime   time.Time
+	failureThreshold  int
+	recoveryTimeout   time.Duration
+}
+
+func NewCircuitBreaker(failureThreshold int, recoveryTimeout time.Duration) *CircuitBreaker {
+	return &CircuitBreaker{
+		state:            CircuitClosed,
+		failureThreshold: failureThreshold,
+		recoveryTimeout:  recoveryTimeout,
+	}
+}
+
+func (cb *CircuitBreaker) Call(fn func() error) error {
+	cb.mu.RLock()
+	state := cb.state
+	cb.mu.RUnlock()
+
+	switch state {
+	case CircuitOpen:
+		cb.mu.Lock()
+		if time.Since(cb.lastFailureTime) >= cb.recoveryTimeout {
+			cb.state = CircuitHalfOpen
+			cb.mu.Unlock()
+			logger.Log.Info("Circuit breaker transitioning to half-open state")
+		} else {
+			cb.mu.Unlock()
+			return fmt.Errorf("circuit breaker is open")
+		}
+		fallthrough
+	case CircuitHalfOpen:
+		err := fn()
+		cb.mu.Lock()
+		if err != nil {
+			cb.failureCount++
+			cb.lastFailureTime = time.Now()
+			cb.state = CircuitOpen
+			cb.mu.Unlock()
+			logger.Log.Warn("Circuit breaker call failed, transitioning to open state", zap.Error(err))
+			return err
+		}
+		cb.state = CircuitClosed
+		cb.failureCount = 0
+		cb.mu.Unlock()
+		logger.Log.Info("Circuit breaker call succeeded, transitioning to closed state")
+		return nil
+	case CircuitClosed:
+		err := fn()
+		cb.mu.Lock()
+		if err != nil {
+			cb.failureCount++
+			cb.lastFailureTime = time.Now()
+			if cb.failureCount >= cb.failureThreshold {
+				cb.state = CircuitOpen
+				logger.Log.Warn("Circuit breaker failure threshold reached, transitioning to open state", 
+					zap.Int("failureCount", cb.failureCount),
+					zap.Int("threshold", cb.failureThreshold),
+				)
+			}
+		} else {
+			cb.failureCount = 0
+		}
+		cb.mu.Unlock()
+		return err
+	}
+	return nil
+}
+
 type WebhookSender interface {
 	Enqueue(payload NotificationPayload, backupSpec model.BackupSpec)
 	Stop()
 }
 
-// NotificationPayload defines the JSON structure for webhook notifications.
 type NotificationPayload struct {
 	ContainerID     string  `json:"container_id"`
 	ContainerName   string  `json:"container_name"`
@@ -53,46 +130,39 @@ type NotificationPayload struct {
 	DestinationType string  `json:"destination_type,omitempty"`
 }
 
-// workItem is what's actually placed on the queue
 type workItem struct {
 	payload     NotificationPayload
 	targetURL   string
-	secret      string // Use the specific secret for this targetURL
-	containerID string // For logging in worker, if payload doesn't have it yet
-	dbType      string // For logging
+	secret      string
+	containerID string 
+	dbType      string
 }
 
-// Sender handles sending webhook notifications asynchronously with retries.
-// It now implements the WebhookSender interface.
 type Sender struct {
-	httpClient  *http.Client
-	globalURL   string
-	globalSecret string
-	maxRetries  int
-	queue       chan workItem
-	stopChan    chan struct{}
-	wg          sync.WaitGroup
+	httpClient     *http.Client
+	globalURL      string
+	globalSecret   string
+	maxRetries     int
+	queue          chan workItem
+	stopChan       chan struct{}
+	wg             sync.WaitGroup
+	circuitBreaker *CircuitBreaker
 }
 
-// Ensure Sender implements WebhookSender
 var _ WebhookSender = (*Sender)(nil)
 
-// extractHost parses a URL string and returns its hostname.
-// Returns "unknown_host" if parsing fails or hostname is empty.
 func extractHost(urlString string) string {
 	if urlString == "" {
 		return "unknown_host"
 	}
 	u, err := url.Parse(urlString)
 	if err != nil || u.Hostname() == "" {
-		// Log parsing error for diagnostics, but return a safe label
 		logger.Log.Debug("Failed to parse hostname from URL for metrics label", zap.String("url", urlString), zap.Error(err))
 		return "unknown_host"
 	}
 	return u.Hostname()
 }
 
-// NewSender creates a new webhook Sender.
 func NewSender(globalConfig map[string]string) *Sender {
 	timeoutSeconds := DefaultWebhookTimeoutSeconds
 	if timeoutStr, ok := globalConfig[GlobalConfigKeyWebhookTimeout]; ok {
@@ -116,11 +186,12 @@ func NewSender(globalConfig map[string]string) *Sender {
 		httpClient: &http.Client{
 			Timeout: time.Duration(timeoutSeconds) * time.Second,
 		},
-		globalURL:   globalConfig[GlobalConfigKeyWebhookURL],
-		globalSecret: globalConfig[GlobalConfigKeyWebhookSecret],
-		maxRetries:  maxRetries,
-		queue:       make(chan workItem, 100),
-		stopChan:    make(chan struct{}),
+		globalURL:      globalConfig[GlobalConfigKeyWebhookURL],
+		globalSecret:   globalConfig[GlobalConfigKeyWebhookSecret],
+		maxRetries:     maxRetries,
+		queue:          make(chan workItem, 100),
+		stopChan:       make(chan struct{}),
+		circuitBreaker: NewCircuitBreaker(5, 5*time.Minute), 
 	}
 
 	s.wg.Add(1)
@@ -135,7 +206,6 @@ func NewSender(globalConfig map[string]string) *Sender {
 	return s
 }
 
-// Enqueue adds a notification payload to the send queue.
 func (s *Sender) Enqueue(payload NotificationPayload, backupSpec model.BackupSpec) {
 	targetURL := s.globalURL
 	if backupSpec.Webhook != "" {
@@ -153,7 +223,7 @@ func (s *Sender) Enqueue(payload NotificationPayload, backupSpec model.BackupSpe
 		return
 	}
 
-	actualSecret := s.globalSecret // Assuming global secret for all for now
+		actualSecret := s.globalSecret
 
 	item := workItem{
 		payload:     payload,
@@ -171,20 +241,33 @@ func (s *Sender) Enqueue(payload NotificationPayload, backupSpec model.BackupSpe
 	}
 }
 
-// worker processes notifications from the queue.
 func (s *Sender) worker() {
 	defer s.wg.Done()
 	logger.Log.Info("Webhook worker started.")
 	for {
 		select {
-		case item := <-s.queue:
+			case item, ok := <-s.queue:
+				if !ok {
+					logger.Log.Info("Webhook queue closed, draining remaining items...")
+					for remainingItem := range s.queue {
+						logFields := []zap.Field{
+							zap.String("containerID", remainingItem.containerID),
+							zap.String("dbType", remainingItem.dbType),
+							zap.String("targetURL", remainingItem.targetURL),
+						}
+						logger.Log.Debug("Worker processing remaining webhook", logFields...)
+						s.sendWithRetries(remainingItem.payload, remainingItem.targetURL, remainingItem.secret, logFields)
+					}
+					logger.Log.Info("Webhook worker stopped after draining queue.")
+					return
+				}
 			logFields := []zap.Field{
 				zap.String("containerID", item.containerID),
 				zap.String("dbType", item.dbType),
 				zap.String("targetURL", item.targetURL),
 			}
 			logger.Log.Debug("Worker picked up webhook for processing", logFields...)
-			s.sendWithRetries(item.payload, item.targetURL, item.secret, logFields) // Pass logFields for context
+				s.sendWithRetries(item.payload, item.targetURL, item.secret, logFields)
 		case <-s.stopChan:
 			logger.Log.Info("Webhook worker stopping.")
 			return
@@ -192,7 +275,6 @@ func (s *Sender) worker() {
 	}
 }
 
-// sendWithRetries attempts to send the payload, retrying on failure.
 func (s *Sender) sendWithRetries(payload NotificationPayload, targetURL, secretKey string, baseLogFields []zap.Field) {
 	if targetURL == "" {
 	    logger.Log.Warn("Webhook send attempt skipped: no target URL.", baseLogFields...)
@@ -200,36 +282,41 @@ func (s *Sender) sendWithRetries(payload NotificationPayload, targetURL, secretK
 	}
 
 	targetHost := extractHost(targetURL)
+	
+	err := s.circuitBreaker.Call(func() error {
 	var lastErr error
-
 	for attempt := 0; attempt <= s.maxRetries; attempt++ {
 		currentAttemptFields := append(baseLogFields, zap.Int("attempt", attempt+1), zap.Int("maxAttempts", s.maxRetries+1), zap.String("targetHost", targetHost))
-		lastErr = s.sendAttempt(payload, targetURL, secretKey, targetHost) // Pass targetHost
+			lastErr = s.sendAttempt(payload, targetURL, secretKey, targetHost)
 		if lastErr == nil {
 			logger.Log.Info("Webhook sent successfully", currentAttemptFields...)
-			return // Success
+				return nil
 		}
 		logger.Log.Warn("Webhook send attempt failed", append(currentAttemptFields, zap.Error(lastErr))...)
 		if attempt < s.maxRetries {
-			backoffDuration := time.Duration(2<<attempt) * time.Second // Exponential backoff (2s, 4s, 8s...)
+				backoffDuration := time.Duration(2<<attempt) * time.Second
+				if backoffDuration > 10*time.Second {
+					backoffDuration = 10 * time.Second
+				}
 			logger.Log.Info("Retrying webhook...", append(currentAttemptFields, zap.Duration("backoff", backoffDuration))...)
 			time.Sleep(backoffDuration)
 		}
 	}
-	logger.Log.Error("Webhook failed after all retries.", append(baseLogFields, zap.String("targetHost", targetHost), zap.Error(lastErr))...)
+		return lastErr
+	})
+	
+	if err != nil {
+		logger.Log.Error("Webhook failed after circuit breaker protection", append(baseLogFields, zap.String("targetHost", targetHost), zap.Error(err))...)
+}
 }
 
-// sendAttempt performs a single attempt to send the webhook.
-func (s *Sender) sendAttempt(payload NotificationPayload, targetURL string, secretKey string, targetHostLabel string) error {
+func (s *Sender) sendAttempt(payload NotificationPayload, targetURL string, secretKey string, _ string) error {
 	jsonData, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("failed to marshal webhook payload: %w", err)
 	}
 
-	reqCtx, cancel := context.WithTimeout(context.Background(), s.httpClient.Timeout)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, targetURL, bytes.NewBuffer(jsonData))
+		req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, targetURL, bytes.NewBuffer(jsonData))
 	if err != nil {
 		return fmt.Errorf("failed to create webhook request: %w", err)
 	}
@@ -239,11 +326,7 @@ func (s *Sender) sendAttempt(payload NotificationPayload, targetURL string, secr
 
 	if secretKey != "" {
 		hmacHash := hmac.New(sha256.New, []byte(secretKey))
-		_, err = hmacHash.Write(jsonData)
-		if err != nil {
-			logger.Log.Error("HMAC generation failed internally (should not happen)", zap.Error(err))
-			return fmt.Errorf("failed to compute HMAC for webhook: %w", err)
-		}
+			hmacHash.Write(jsonData) 
 		req.Header.Set(HMACHeaderName, hex.EncodeToString(hmacHash.Sum(nil)))
 	}
 
@@ -254,21 +337,22 @@ func (s *Sender) sendAttempt(payload NotificationPayload, targetURL string, secr
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		bodyBytes, readErr := io.ReadAll(resp.Body)
+			bodyBytes, readErr := io.ReadAll(io.LimitReader(resp.Body, 1024*64)) 
 		if readErr != nil {
 			logger.Log.Warn("Failed to read error response body from webhook", zap.String("targetURL", targetURL), zap.String("status", resp.Status), zap.Error(readErr))
 		}
 		return fmt.Errorf("webhook request to %s returned non-2xx status: %s. Body: %s", targetURL, resp.Status, string(bodyBytes))
 	}
 
+	
+		_, _ = io.Copy(io.Discard, resp.Body)
 	logger.Log.Debug("Webhook response successful", zap.String("status", resp.Status))
 	return nil
 }
 
-// Stop gracefully shuts down the webhook sender and its worker.
 func (s *Sender) Stop() {
 	logger.Log.Info("Stopping webhook sender...")
-	close(s.stopChan) 
+		close(s.queue) 
 	s.wg.Wait()       
 	logger.Log.Info("Webhook sender stopped.")
 } 

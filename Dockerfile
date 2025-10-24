@@ -18,9 +18,22 @@ RUN apk add --no-cache \
     postgresql-client \
     mysql-client \
     mongodb-tools \
-    redis
+    redis \
+    curl \
+    bash
+
+# Create non-root user for security
+RUN addgroup -g 1001 -S appgroup && \
+    adduser -u 1001 -S appuser -G appgroup
+
+# Create backup directory with proper permissions
+RUN mkdir -p /backups && \
+    chown -R appuser:appgroup /backups
 
 WORKDIR /
 COPY --from=builder /label-backup /label-backup
+
+# Switch to non-root user
+USER appuser
 
 ENTRYPOINT ["/label-backup"] 

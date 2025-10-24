@@ -40,3 +40,61 @@ LICENSE
 
 # Go module vendor directory (if you were to use it)
 vendor/ 
+
+# Test files and directories
+integration-tests/
+docs/
+examples/
+*.test
+*_test.go
+
+# Development files
+.env
+.env.local
+.env.development
+.env.test
+.env.production
+
+# Temporary files
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+
+# Coverage reports
+*.cover
+coverage.out
+coverage.html
+
+# Profiling files
+*.prof
+*.pprof
+
+# Build cache
+.cache/
+build/
+dist/
+
+# Node modules
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Python files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Backup files
+*.bak
+*.backup
+*.old 

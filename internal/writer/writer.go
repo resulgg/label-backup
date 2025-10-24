@@ -2,6 +2,7 @@ package writer
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"io"
 	"strings"
@@ -14,53 +15,36 @@ import (
 )
 
 const (
-	// GlobalConfigKeyS3Bucket is the key for the S3 bucket name in global config.
 	GlobalConfigKeyS3Bucket = "BUCKET_NAME"
-	// GlobalConfigKeyS3Region is the key for the AWS S3 region in global config.
 	GlobalConfigKeyS3Region = "REGION"
-	// GlobalConfigKeyS3Endpoint is the key for the S3-compatible endpoint in global config.
 	GlobalConfigKeyS3Endpoint = "ENDPOINT"
-	// GlobalConfigKeyS3AccessKeyID is the key for the S3 access key ID in global config.
 	GlobalConfigKeyS3AccessKeyID = "ACCESS_KEY_ID"
-	// GlobalConfigKeyS3SecretAccessKey is the key for the S3 secret access key in global config.
 	GlobalConfigKeyS3SecretAccessKey = "SECRET_ACCESS_KEY"
-	// GlobalConfigKeyLocalPath is the key for the local backup path in global config.
 	GlobalConfigKeyLocalPath = "LOCAL_BACKUP_PATH"
-	// DefaultLocalPath is the default path for local backups if not overridden.
 	DefaultLocalPath = "/backups"
 )
 
-// BackupObjectMeta holds metadata about a stored backup object.
 type BackupObjectMeta struct {
-	Key          string    // Full path/key of the object
-	LastModified time.Time // Last modified timestamp
-	Size         int64     // Size in bytes
+	Key          string
+	LastModified time.Time
+	Size         int64
+	Checksum     string
 }
 
-// BackupWriter defines the interface for writing backup data to a destination.
 type BackupWriter interface {
-	// Write takes the backup data from the reader and writes it to the destination.
-	// objectName is the suggested name for the backup object (e.g., prefix/dbname-timestamp.sql.gz).
-	// reader provides the gzipped backup data.
-	// Returns final path/URL, number of bytes written, and an error if any.
-	Write(ctx context.Context, objectName string, reader io.Reader) (destination string, bytesWritten int64, err error)
-	// Type returns the type of the writer (e.g., "local", "s3")
+	Write(ctx context.Context, objectName string, reader io.Reader) (destination string, bytesWritten int64, checksum string, err error)
 	Type() string
 
-	// ListObjects lists backup objects, optionally filtered by a prefix.
-	// The prefix corresponds to spec.Prefix.
 	ListObjects(ctx context.Context, prefix string) ([]BackupObjectMeta, error)
+	ReadObject(ctx context.Context, objectName string) (io.ReadCloser, error)
 
-	// DeleteObject deletes a backup object by its key.
 	DeleteObject(ctx context.Context, key string) error
 }
 
-// NewWriterFunc is a function type that creates a new BackupWriter.
 type NewWriterFunc func(spec model.BackupSpec, globalConfig map[string]string) (BackupWriter, error)
 
 var writerFactories = make(map[string]NewWriterFunc)
 
-// RegisterWriterFactory allows different writer implementations to register themselves.
 func RegisterWriterFactory(destType string, factory NewWriterFunc) {
 	if factory == nil {
 		logger.Log.Fatal("Writer factory is nil", zap.String("destType", destType))
@@ -72,12 +56,10 @@ func RegisterWriterFactory(destType string, factory NewWriterFunc) {
 	logger.Log.Info("Registered writer factory", zap.String("destType", destType))
 }
 
-// GetWriter returns a BackupWriter for the given destination type from the BackupSpec.
-// globalConfig can provide S3 bucket names, local paths, etc.
 func GetWriter(spec model.BackupSpec, globalConfig map[string]string) (BackupWriter, error) {
 	destType := strings.ToLower(spec.Dest)
 	if destType == "" {
-		destType = "local" // Default to local if not specified
+		destType = "local"
 		logger.Log.Debug("Destination type not specified, defaulting to local",
 			zap.String("containerID", spec.ContainerID),
 		)
@@ -96,16 +78,12 @@ func GetWriter(spec model.BackupSpec, globalConfig map[string]string) (BackupWri
 	return factory(spec, globalConfig)
 }
 
-// GenerateObjectName creates a standardized object name for the backup.
-// Example: my-prefix/postgres-mydb-20230101150405.sql.gz
 func GenerateObjectName(spec model.BackupSpec) string {
 	timestamp := time.Now().UTC().Format("20060102150405")
 	var dbNamePart string
 	if spec.Database != "" {
 		dbNamePart = spec.Database
 	} else {
-		// Try to derive from Conn string as a fallback (very basic)
-		// This is not robust. A better way would be to have the dumper return the effective DB name.
 		lastSlash := strings.LastIndex(spec.Conn, "/")
 		lastQ := strings.LastIndex(spec.Conn, "?")
 		if lastSlash != -1 {
@@ -118,8 +96,7 @@ func GenerateObjectName(spec model.BackupSpec) string {
 			dbNamePart = "database"
 		}
 	}
-	// Sanitize dbNamePart (replace non-alphanum with underscore)
-	dbNamePart = strings.ReplaceAll(dbNamePart, ":", "_") // common in host:port/db
+	dbNamePart = strings.ReplaceAll(dbNamePart, ":", "_") 
 	dbNamePart = strings.Map(func(r rune) rune {
         if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '.' {
             return r
@@ -133,4 +110,35 @@ func GenerateObjectName(spec model.BackupSpec) string {
 		return fmt.Sprintf("%s/%s", strings.Trim(spec.Prefix, "/"), fileName)
 	}
 	return fileName
+}
+
+func ValidateBackup(ctx context.Context, reader io.Reader) (string, error) {
+	// Read and validate gzip header
+	header := make([]byte, 3)
+	n, err := reader.Read(header)
+	if err != nil && err != io.EOF {
+		return "", fmt.Errorf("failed to read backup header: %w", err)
+	}
+	
+	if n < 2 || header[0] != 0x1f || header[1] != 0x8b {
+		return "", fmt.Errorf("invalid gzip header: expected magic bytes 0x1f8b, got %x", header[:n])
+	}
+	
+	// Calculate SHA256 checksum of the entire backup
+	hash := sha256.New()
+	
+	// Write the header bytes we already read
+	if n > 0 {
+		hash.Write(header[:n])
+	}
+	
+	// Read and hash the rest of the stream
+	_, err = io.Copy(hash, reader)
+	if err != nil {
+		return "", fmt.Errorf("failed to read backup data for checksum: %w", err)
+	}
+	
+	checksum := fmt.Sprintf("%x", hash.Sum(nil))
+	logger.Log.Debug("Backup validation successful", zap.String("checksum", checksum))
+	return checksum, nil
 } 

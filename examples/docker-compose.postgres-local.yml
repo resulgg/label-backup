@@ -1,0 +1,31 @@
+version: "3.8"
+
+services:
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_DB: myapp
+      POSTGRES_USER: appuser
+      POSTGRES_PASSWORD: apppass
+    labels:
+      backup.enabled: "true"
+      backup.cron: "0 2 * * *"
+      backup.type: "postgres"
+      backup.conn: "postgresql://appuser:apppass@postgres:5432/myapp"
+      backup.dest: "local"
+      backup.prefix: "postgres-backups"
+      backup.retention: "7d"
+
+  label-backup:
+    image: resulgg/label-backup
+    environment:
+      LOCAL_BACKUP_PATH: "/backups"
+      GLOBAL_RETENTION_PERIOD: "30d"
+      LOG_LEVEL: "info"
+    volumes:
+      - ./backups:/backups
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on:
+      - postgres
+    ports:
+      - "8080:8080"

@@ -1,0 +1,35 @@
+version: "3.8"
+
+services:
+  mysql:
+    image: mysql:8.0
+    environment:
+      MYSQL_DATABASE: analytics
+      MYSQL_USER: analytics
+      MYSQL_PASSWORD: analyticspass
+      MYSQL_ROOT_PASSWORD: rootpass
+    labels:
+      backup.enabled: "true"
+      backup.cron: "0 3 * * *"
+      backup.type: "mysql"
+      backup.conn: "mysql://analytics:analyticspass@mysql:3306/analytics"
+      backup.dest: "s3"
+      backup.prefix: "mysql-backups"
+      backup.retention: "14d"
+
+  label-backup:
+    image: resulgg/label-backup
+    environment:
+      BUCKET_NAME: "my-backup-bucket"
+      REGION: "us-west-2"
+      ACCESS_KEY_ID: "your-access-key"
+      SECRET_ACCESS_KEY: "your-secret-key"
+      GLOBAL_RETENTION_PERIOD: "30d"
+      WEBHOOK_URL: "https://hooks.slack.com/services/your/webhook/url"
+      WEBHOOK_SECRET: "your-webhook-secret"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on:
+      - mysql
+    ports:
+      - "8080:8080"

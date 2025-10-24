@@ -12,23 +12,16 @@ import (
 	"go.uber.org/zap"
 )
 
-// const DefaultGlobalRetentionDays = 30 // No longer used directly here, main.go has default duration string
-// const GlobalConfigKeyRetentionDays = "GLOBAL_RETENTION_DAYS" // No longer used here
-const GlobalConfigKeyGCDryRun = "GC_DRY_RUN" // Keep for reference if main needs it, though it will pass bool
-
-// Runner manages the garbage collection process for a specific backup setup.
 type Runner struct {
 	spec              model.BackupSpec
 	backupWriter      writer.BackupWriter
-	effectiveRetention time.Duration // The actual retention to apply (spec or global)
+	effectiveRetention time.Duration
 	dryRun            bool
 }
 
-// NewRunner creates a new GC Runner.
-// It determines the effective retention period from the spec or the provided global retention period.
 func NewRunner(spec model.BackupSpec, bw writer.BackupWriter, globalRetentionPeriod time.Duration, dryRun bool) (*Runner, error) {
 	retentionToUse := globalRetentionPeriod
-	if spec.Retention > 0 { // spec.Retention is time.Duration; 0 means use global
+	if spec.Retention > 0 {
 		retentionToUse = spec.Retention
 		logger.Log.Info("GC: Using spec-defined retention period",
 			zap.String("containerID", spec.ContainerID),
@@ -46,8 +39,6 @@ func NewRunner(spec model.BackupSpec, bw writer.BackupWriter, globalRetentionPer
 			zap.String("containerID", spec.ContainerID),
 			zap.Duration("effectiveRetention", retentionToUse),
 		)
-		// Optionally, could return an error or a specific type of runner that no-ops.
-		// For now, proceeding will mean no files are deleted by this runner if retention is <=0.
 	}
 
 	logger.Log.Info("GC Runner configured",
@@ -66,14 +57,13 @@ func NewRunner(spec model.BackupSpec, bw writer.BackupWriter, globalRetentionPer
 	}, nil
 }
 
-// RunGC executes the garbage collection logic.
 func (r *Runner) RunGC(ctx context.Context) error {
 	if r.effectiveRetention <= 0 {
 		logger.Log.Info("GC: Skipping run as effective retention period is not positive.",
 			zap.String("containerID", r.spec.ContainerID),
 			zap.Duration("effectiveRetention", r.effectiveRetention),
 		)
-		return nil // Nothing to do
+		return nil
 	}
 
 	logger.Log.Info("Starting GC run",
@@ -84,7 +74,9 @@ func (r *Runner) RunGC(ctx context.Context) error {
 		zap.Bool("dryRun", r.dryRun),
 	)
 
-	objects, err := r.backupWriter.ListObjects(ctx, r.spec.Prefix)
+	listCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	objects, err := r.backupWriter.ListObjects(listCtx, r.spec.Prefix)
 	if err != nil {
 		logger.Log.Error("GC failed to list objects",
 			zap.String("containerID", r.spec.ContainerID),
@@ -103,8 +95,10 @@ func (r *Runner) RunGC(ctx context.Context) error {
 	}
 
 	deleteCount := 0
+	var failedDeletes []string
+	var totalSizeFreed int64
 	now := time.Now().UTC()
-	cutoffDate := now.Add(-r.effectiveRetention) // Use the effective retention
+	cutoffDate := now.Add(-r.effectiveRetention)
 
 	logger.Log.Info("GC: Object scan details",
 		zap.String("containerID", r.spec.ContainerID),
@@ -118,37 +112,51 @@ func (r *Runner) RunGC(ctx context.Context) error {
 			logger.Log.Warn("GC run cancelled during object iteration",
 				zap.String("containerID", r.spec.ContainerID),
 				zap.String("prefix", r.spec.Prefix),
+				zap.Int("processedCount", deleteCount),
+				zap.Int("totalCount", len(objects)),
 				zap.Error(ctx.Err()),
 			)
 			return ctx.Err()
 		}
+		
 		if obj.LastModified.Before(cutoffDate) {
 			logger.Log.Info("GC: Object qualifies for deletion",
 				zap.String("containerID", r.spec.ContainerID),
 				zap.String("key", obj.Key),
 				zap.Time("lastModified", obj.LastModified),
+				zap.Int64("size", obj.Size),
 			)
 			if r.dryRun {
 				logger.Log.Info("[DryRun] GC: Would delete object",
 					zap.String("containerID", r.spec.ContainerID),
 					zap.String("key", obj.Key),
+					zap.Int64("size", obj.Size),
 				)
 				deleteCount++
+				totalSizeFreed += obj.Size
 			} else {
-				err := r.backupWriter.DeleteObject(ctx, obj.Key)
+				deleteCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+				err := r.backupWriter.DeleteObject(deleteCtx, obj.Key)
+				cancel()
 				if err != nil {
 					logger.Log.Error("GC: Failed to delete object",
 						zap.String("containerID", r.spec.ContainerID),
 						zap.String("key", obj.Key),
 						zap.Error(err),
 					)
-					continue // Try to delete other objects
+					failedDeletes = append(failedDeletes, obj.Key)
+					continue
 				}
 				logger.Log.Info("GC: Successfully deleted object",
 					zap.String("containerID", r.spec.ContainerID),
 					zap.String("key", obj.Key),
+					zap.Int64("size", obj.Size),
 				)
 				deleteCount++
+				totalSizeFreed += obj.Size
+				
+				// Rate limiting - small delay between deletes
+				time.Sleep(100 * time.Millisecond)
 			}
 		} else {
 			logger.Log.Debug("GC: Object is within retention period. Keeping.",
@@ -163,12 +171,20 @@ func (r *Runner) RunGC(ctx context.Context) error {
 	if r.dryRun {
 		statusMsg = "that would be deleted (dry run)"
 	}
+	
 	logger.Log.Info("GC run completed",
 		zap.String("containerID", r.spec.ContainerID),
 		zap.String("prefix", r.spec.Prefix),
 		zap.Int("objectsConsidered", len(objects)),
 		zap.String("status", statusMsg),
 		zap.Int("objectsAffected", deleteCount),
+		zap.Int64("totalSizeFreed", totalSizeFreed),
+		zap.Int("failedDeletes", len(failedDeletes)),
 	)
+	
+	if len(failedDeletes) > 0 {
+		return fmt.Errorf("GC completed with %d failures: %v", len(failedDeletes), failedDeletes)
+	}
+	
 	return nil
 } 

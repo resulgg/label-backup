@@ -1,0 +1,32 @@
+version: "3.8"
+
+services:
+  postgres-dev:
+    image: postgres:15
+    environment:
+      POSTGRES_DB: devdb
+      POSTGRES_USER: devuser
+      POSTGRES_PASSWORD: devpass
+    labels:
+      backup.enabled: "true"
+      backup.cron: "0 0 * * *"
+      backup.type: "postgres"
+      backup.conn: "postgresql://devuser:devpass@postgres-dev:5432/devdb"
+      backup.dest: "local"
+      backup.prefix: "dev/postgres"
+      backup.retention: "3d"
+
+  label-backup:
+    image: resulgg/label-backup
+    environment:
+      LOCAL_BACKUP_PATH: "/backups"
+      GLOBAL_RETENTION_PERIOD: "7d"
+      LOG_LEVEL: "debug"
+      GC_DRY_RUN: "true"
+    volumes:
+      - ./dev-backups:/backups
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on:
+      - postgres-dev
+    ports:
+      - "8080:8080"

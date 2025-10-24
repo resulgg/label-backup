@@ -1,6 +1,7 @@
 package dumper
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -15,7 +16,6 @@ import (
 
 const MongoDBDumperType = "mongodb"
 
-// MongoDBDumper implements the Dumper interface for MongoDB databases.
 type MongoDBDumper struct {
 	spec model.BackupSpec
 }
@@ -24,7 +24,6 @@ func init() {
 	RegisterDumperFactory(MongoDBDumperType, NewMongoDBDumper)
 }
 
-// NewMongoDBDumper creates a new MongoDBDumper.
 func NewMongoDBDumper(spec model.BackupSpec) (Dumper, error) {
 	if spec.Type != MongoDBDumperType {
 		err := fmt.Errorf("invalid dumper type for mongodb: %s", spec.Type)
@@ -38,19 +37,12 @@ func NewMongoDBDumper(spec model.BackupSpec) (Dumper, error) {
 	return &MongoDBDumper{spec: spec}, nil
 }
 
-// Dump executes mongodump for the MongoDB database specified in the BackupSpec.
 func (d *MongoDBDumper) Dump(ctx context.Context, spec model.BackupSpec, writer io.Writer) error {
-	// mongodump --uri="mongodb://user:password@host:port/dbname" --archive
-	// --archive writes to standard output. Add --gzip if mongodump supports it directly,
-	// otherwise our StreamAndGzip will handle it.
-	// mongodump itself can output gzip, so we can use that if available and skip our own gzip.
-	// For consistency and to ensure our StreamAndGzip handles all cases (e.g. if native gzip fails or is not available),
-	// we will let StreamAndGzip handle the compression.
+	
 
 	args := []string{}
 	loggedArgs := []string{}
 
-	// URI is the primary way to connect
 	if spec.Conn != "" {
 		args = append(args, fmt.Sprintf("--uri=%s", spec.Conn))
 		maskedURI := spec.Conn
@@ -69,8 +61,6 @@ func (d *MongoDBDumper) Dump(ctx context.Context, spec model.BackupSpec, writer 
 		return fmt.Errorf("mongodb connection string (spec.Conn) is empty for container %s", spec.ContainerID)
 	}
 
-	// If spec.Database is provided, it might be part of the URI or specified separately.
-	// If it's in the URI, mongodump uses it. If not, and spec.Database is set, use --db.
 	dbToDump := ""
 	if spec.Database != "" {
 		if !strings.Contains(spec.Conn, "/"+spec.Database+"?") && !strings.HasSuffix(spec.Conn, "/"+spec.Database) {
@@ -97,7 +87,6 @@ func (d *MongoDBDumper) Dump(ctx context.Context, spec model.BackupSpec, writer 
 		}
 	}
 
-	// Output to stdout for piping
 	args = append(args, "--archive")
 	loggedArgs = append(loggedArgs, "--archive")
 
@@ -111,4 +100,44 @@ func (d *MongoDBDumper) Dump(ctx context.Context, spec model.BackupSpec, writer 
 	)
 
 	return StreamAndGzip(ctx, cmd, writer)
+}
+
+func (d *MongoDBDumper) TestConnection(ctx context.Context, spec model.BackupSpec) error {
+	if spec.Conn == "" {
+		return fmt.Errorf("mongodb connection string is empty")
+	}
+
+	dbToTest := ""
+	if spec.Database != "" {
+		dbToTest = spec.Database
+	} else {
+		uriParts := strings.Split(spec.Conn, "/")
+		if len(uriParts) > 1 {
+			lastPart := uriParts[len(uriParts)-1]
+			qmarkIdx := strings.Index(lastPart, "?")
+			if qmarkIdx != -1 {
+				dbToTest = lastPart[:qmarkIdx]
+			} else {
+				dbToTest = lastPart
+			}
+		}
+	}
+
+	// Use mongodump for connection testing - just check if we can connect
+	cmd := exec.CommandContext(ctx, "mongodump", "--uri", spec.Conn, "--out", "/tmp", "--quiet")
+
+	var stderrBuf bytes.Buffer
+	cmd.Stderr = &stderrBuf
+
+	logger.Log.Debug("Testing MongoDB connection",
+		zap.String("containerID", spec.ContainerID),
+		zap.String("database", dbToTest),
+	)
+
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("connection test failed for MongoDB: %w (stderr: %s)", err, stderrBuf.String())
+	}
+
+	logger.Log.Debug("MongoDB connection test successful", zap.String("containerID", spec.ContainerID))
+	return nil
 }
