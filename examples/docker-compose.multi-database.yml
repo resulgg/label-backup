@@ -66,7 +66,7 @@ services:
       SECRET_ACCESS_KEY: "your-secret-key"
       LOCAL_BACKUP_PATH: "/backups"
       GLOBAL_RETENTION_PERIOD: "90d"
-      CONCURRENT_BACKUP_LIMIT: "2"
+      CONCURRENT_BACKUP_LIMIT: "10"
       WEBHOOK_URL: "https://hooks.slack.com/services/your/webhook/url"
       WEBHOOK_SECRET: "your-webhook-secret"
       LOG_LEVEL: "info"
