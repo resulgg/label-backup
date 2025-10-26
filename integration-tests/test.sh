@@ -35,15 +35,6 @@ test_health() {
         return 1
     fi
     
-    # Test /status
-    if curl -f -s http://localhost:8080/status > /dev/null; then
-        echo -e "${GREEN}✅ /status endpoint working${NC}"
-        echo "Status response:"
-        curl -s http://localhost:8080/status | jq '.'
-    else
-        echo -e "${RED}❌ /status endpoint failed${NC}"
-        return 1
-    fi
 }
 
 test_webhook() {
@@ -195,7 +186,6 @@ main() {
     echo "- SIGHUP reload: ✅"
     echo ""
     echo "🔗 Access URLs:"
-    echo "- Label Backup Status: http://localhost:8080/status"
     echo "- MinIO Console: http://localhost:9001 (minioadmin/minioadmin)"
     echo "- Webhook Test Server: http://localhost:8081/health"
     echo ""

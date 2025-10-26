@@ -70,6 +70,256 @@ Label Backup solves this by using Docker labels to automatically discover databa
 - Circuit breaker pattern to prevent webhook spam
 - Configurable retry logic with exponential backoff
 
+#### Webhook Payload Structure
+
+Label Backup sends detailed JSON payloads containing comprehensive backup information:
+
+**Success Payload Example:**
+
+```json
+{
+  "container_id": "dbe737c824731c8f8c34e356d38a183502024c136a180618cf34ae08783ef649",
+  "container_name": "myapp_postgres",
+  "database_type": "postgres",
+  "database_name": "myapp",
+  "destination_url": "s3://my-backup-bucket/postgres-backups/postgres-myapp-20250124105400.sql.gz",
+  "success": true,
+  "backup_size_bytes": 1048576,
+  "duration_seconds": 2.45,
+  "timestamp_utc": "2025-01-24T10:54:00.123456Z",
+  "cron_schedule": "0 2 * * *",
+  "backup_prefix": "postgres-backups",
+  "destination_type": "s3"
+}
+```
+
+**Failure Payload Example:**
+
+```json
+{
+  "container_id": "dbe737c824731c8f8c34e356d38a183502024c136a180618cf34ae08783ef649",
+  "container_name": "myapp_postgres",
+  "database_type": "postgres",
+  "database_name": "myapp",
+  "destination_url": "",
+  "success": false,
+  "error": "connection refused: database server is not responding",
+  "duration_seconds": 30.0,
+  "timestamp_utc": "2025-01-24T10:54:00.123456Z",
+  "cron_schedule": "0 2 * * *",
+  "backup_prefix": "postgres-backups",
+  "destination_type": "s3"
+}
+```
+
+**Payload Fields:**
+
+| Field               | Type    | Required | Description                                             |
+| ------------------- | ------- | -------- | ------------------------------------------------------- |
+| `container_id`      | string  | ✅       | Docker container ID                                     |
+| `container_name`    | string  | ✅       | Docker container name                                   |
+| `database_type`     | string  | ✅       | Database type (`postgres`, `mysql`, `mongodb`, `redis`) |
+| `database_name`     | string  | ❌       | Specific database name (for MongoDB)                    |
+| `destination_url`   | string  | ✅       | Full URL/path where backup was stored                   |
+| `success`           | boolean | ✅       | Whether backup succeeded                                |
+| `error`             | string  | ❌       | Error message (only present on failure)                 |
+| `backup_size_bytes` | integer | ❌       | Backup file size in bytes (only on success)             |
+| `duration_seconds`  | float   | ✅       | Backup operation duration                               |
+| `timestamp_utc`     | string  | ✅       | ISO 8601 timestamp in UTC                               |
+| `cron_schedule`     | string  | ❌       | Cron expression for this backup                         |
+| `backup_prefix`     | string  | ❌       | Backup filename prefix                                  |
+| `destination_type`  | string  | ❌       | Destination type (`local`, `s3`)                        |
+
+#### Security & Signature Verification
+
+All webhook payloads are signed using HMAC-SHA256 for security verification:
+
+**HTTP Headers:**
+
+- `Content-Type: application/json`
+- `User-Agent: LabelBackupAgent/1.0`
+- `X-LabelBackup-Signature-SHA256: <hex-encoded-hmac-signature>`
+
+**Signature Calculation:**
+The signature is calculated as: `HMAC-SHA256(webhook_secret, raw_json_body)`
+
+**Verification Process:**
+
+1. Extract the signature from the `X-LabelBackup-Signature-SHA256` header
+2. Calculate the expected signature using your webhook secret
+3. Compare signatures using timing-safe comparison
+4. Only process the payload if signatures match
+
+#### Implementation Example
+
+Here's a complete Node.js/Express example for receiving and verifying webhooks:
+
+```javascript
+const express = require("express");
+const crypto = require("crypto");
+
+const app = express();
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "your-secret-key";
+
+// Middleware to parse JSON
+app.use(
+  express.json({
+    verify: (req, res, buf) => {
+      req.rawBody = buf; // Store raw body for signature verification
+    },
+  })
+);
+
+// Timing-safe string comparison
+function timingSafeEqual(a, b) {
+  if (a.length !== b.length) {
+    return false;
+  }
+  let result = 0;
+  for (let i = 0; i < a.length; i++) {
+    result |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+  return result === 0;
+}
+
+// Verify webhook signature
+function verifySignature(payload, signature, secret) {
+  const expectedSignature = crypto
+    .createHmac("sha256", secret)
+    .update(payload)
+    .digest("hex");
+
+  return timingSafeEqual(signature, expectedSignature);
+}
+
+// Webhook endpoint
+app.post("/webhook", (req, res) => {
+  try {
+    const signature = req.headers["x-labelbackup-signature-sha256"];
+    const rawBody = req.rawBody;
+
+    // Verify signature
+    if (!signature || !verifySignature(rawBody, signature, WEBHOOK_SECRET)) {
+      console.error("Invalid webhook signature");
+      return res.status(401).json({ error: "Invalid signature" });
+    }
+
+    // Parse payload
+    const payload = req.body;
+
+    // Process webhook based on success/failure
+    if (payload.success) {
+      console.log(`✅ Backup successful for ${payload.container_name}`);
+      console.log(
+        `   Database: ${payload.database_type}/${
+          payload.database_name || "default"
+        }`
+      );
+      console.log(
+        `   Size: ${(payload.backup_size_bytes / 1024 / 1024).toFixed(2)} MB`
+      );
+      console.log(`   Duration: ${payload.duration_seconds}s`);
+      console.log(`   Destination: ${payload.destination_url}`);
+
+      // Send success notification to Slack, Discord, etc.
+      // await sendSuccessNotification(payload);
+    } else {
+      console.error(`❌ Backup failed for ${payload.container_name}`);
+      console.error(`   Error: ${payload.error}`);
+      console.error(`   Duration: ${payload.duration_seconds}s`);
+
+      // Send failure alert
+      // await sendFailureAlert(payload);
+    }
+
+    // Log backup event
+    console.log(
+      `Backup event at ${payload.timestamp_utc} for container ${payload.container_id}`
+    );
+
+    res.status(200).json({ received: true });
+  } catch (error) {
+    console.error("Webhook processing error:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Health check endpoint
+app.get("/health", (req, res) => {
+  res.status(200).json({ status: "ok" });
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Webhook server listening on port ${PORT}`);
+  console.log(`Webhook secret configured: ${WEBHOOK_SECRET ? "Yes" : "No"}`);
+});
+```
+
+**Environment Variables:**
+
+```bash
+WEBHOOK_SECRET=your-super-secret-webhook-key
+PORT=3000
+```
+
+**Testing the Webhook:**
+
+```bash
+# Test with curl (replace with your actual webhook URL and secret)
+curl -X POST http://localhost:3000/webhook \
+  -H "Content-Type: application/json" \
+  -H "X-LabelBackup-Signature-SHA256: $(echo -n '{"test":"data"}' | openssl dgst -sha256 -hmac 'your-secret' -hex | cut -d' ' -f2)" \
+  -d '{"test":"data"}'
+```
+
+**Integration with Notification Services:**
+
+```javascript
+// Slack integration example
+async function sendSlackNotification(payload) {
+  const slackWebhook = process.env.SLACK_WEBHOOK_URL;
+  if (!slackWebhook) return;
+
+  const message = payload.success
+    ? `✅ Backup successful: ${payload.container_name} (${payload.database_type})`
+    : `❌ Backup failed: ${payload.container_name} - ${payload.error}`;
+
+  await fetch(slackWebhook, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text: message }),
+  });
+}
+
+// Discord integration example
+async function sendDiscordNotification(payload) {
+  const discordWebhook = process.env.DISCORD_WEBHOOK_URL;
+  if (!discordWebhook) return;
+
+  const embed = {
+    title: payload.success ? "Backup Successful" : "Backup Failed",
+    color: payload.success ? 0x00ff00 : 0xff0000,
+    fields: [
+      { name: "Container", value: payload.container_name, inline: true },
+      { name: "Database", value: payload.database_type, inline: true },
+      { name: "Duration", value: `${payload.duration_seconds}s`, inline: true },
+    ],
+    timestamp: payload.timestamp_utc,
+  };
+
+  if (!payload.success) {
+    embed.fields.push({ name: "Error", value: payload.error, inline: false });
+  }
+
+  await fetch(discordWebhook, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ embeds: [embed] }),
+  });
+}
+```
+
 ### 🗑️ **Retention Policies**
 
 - Automatic pruning of old backups based on configurable retention periods
@@ -79,7 +329,7 @@ Label Backup solves this by using Docker labels to automatically discover databa
 
 ### 🏥 **Health Monitoring**
 
-- Health check endpoints: `/healthz`, `/readyz`, `/status`
+- Health check endpoints: `/healthz`, `/readyz`
 - Database connection pre-validation before backups
 - Docker daemon connectivity monitoring
 - Disk space monitoring for local backups
@@ -138,10 +388,6 @@ services:
 ```bash
 docker-compose up -d
 ```
-
-### 3. Check Status
-
-Visit `http://localhost:8080/status` to see active backup jobs and container information.
 
 ## Configuration
 
@@ -237,7 +483,6 @@ Check out the `examples/` directory for complete working examples:
 
 - `GET /healthz` - Basic health check
 - `GET /readyz` - Readiness probe (checks Docker, disk space, S3)
-- `GET /status` - Detailed status with active jobs and container information
 - `GET /metadata?object=<backup-name>` - Query backup metadata
 
 ### Circuit Breaker
@@ -330,7 +575,7 @@ docker-compose -f integration-tests/docker-compose-test.yml down -v
 
 **Test Coverage:**
 
-- Health check endpoints (`/healthz`, `/readyz`, `/status`)
+- Health check endpoints (`/healthz`, `/readyz`)
 - Database connection testing
 - S3 backup functionality
 - Webhook notifications

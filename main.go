@@ -354,35 +354,6 @@ func main() {
 		json.NewEncoder(w).Encode(metadata)
 	})
 
-	hmux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
-		_, cancel := context.WithTimeout(r.Context(), 10*time.Second)
-		defer cancel()
-
-		registry := discoveryWatcher.GetRegistry()
-		
-		status := map[string]interface{}{
-			"timestamp": time.Now().UTC().Format(time.RFC3339),
-			"active_jobs": len(registry),
-			"containers": make([]map[string]interface{}, 0),
-		}
-
-		for containerID, spec := range registry {
-			containerInfo := map[string]interface{}{
-				"container_id":   containerID,
-				"container_name": spec.ContainerName,
-				"database_type":  spec.Type,
-				"database_name":  spec.Database,
-				"cron_schedule":  spec.Cron,
-				"destination":    spec.Dest,
-				"retention":      spec.Retention.String(),
-			}
-			status["containers"] = append(status["containers"].([]map[string]interface{}), containerInfo)
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(status)
-	})
 
 	server := &http.Server{
 		Addr:    ":8080",

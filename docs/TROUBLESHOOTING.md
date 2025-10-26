@@ -182,8 +182,6 @@ curl http://localhost:8080/healthz
 # Readiness check
 curl http://localhost:8080/readyz
 
-# Detailed status
-curl http://localhost:8080/status
 
 # Query backup metadata
 curl "http://localhost:8080/metadata?object=postgres-mydb-20240101-020000.sql.gz"

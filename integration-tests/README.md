@@ -85,7 +85,7 @@ The R2 test environment includes:
 
 The test suite validates:
 
-- Health check endpoints (`/healthz`, `/readyz`, `/status`, `/metadata`)
+- Health check endpoints (`/healthz`, `/readyz`, `/metadata`)
 - Database connection testing
 - S3 backup functionality (MinIO and R2)
 - Webhook notifications
@@ -99,13 +99,11 @@ The test suite validates:
 
 ### MinIO Test Environment
 
-- **Label Backup Status**: http://localhost:8080/status
 - **MinIO Console**: http://localhost:9001 (minioadmin/minioadmin)
 - **Webhook Test Server**: http://localhost:8081/health
 
 ### R2 Test Environment
 
-- **Label Backup Status**: http://localhost:8080/status
 - **Webhook Test Server**: http://localhost:8081/health
 
 ## Monitoring
@@ -142,8 +140,6 @@ curl http://localhost:8080/healthz
 # Readiness check
 curl http://localhost:8080/readyz
 
-# Detailed status
-curl http://localhost:8080/status
 
 # Metadata endpoint
 curl "http://localhost:8080/metadata?object=test-mongo-backup/mongodb-testmongodb-20251024115200.dump.gz"
@@ -229,7 +225,6 @@ sleep 30
 # Test all health endpoints
 curl http://localhost:8080/healthz
 curl http://localhost:8080/readyz
-curl http://localhost:8080/status
 ```
 
 ### 4. Monitor Backup Process
