@@ -66,6 +66,39 @@ services:
 docker-compose up -d
 ```
 
+### 3. Alternative: Using Docker Run
+
+If you prefer using `docker run` instead of Docker Compose:
+
+```bash
+# Run your database container with labels
+docker run -d \
+  --name postgres-db \
+  -e POSTGRES_DB=myapp \
+  -e POSTGRES_USER=appuser \
+  -e POSTGRES_PASSWORD=apppass \
+  -l backup.enabled="true" \
+  -l backup.cron="0 2 * * *" \
+  -l backup.type="postgres" \
+  -l backup.conn="postgresql://appuser:apppass@postgres-db:5432/myapp" \
+  -l backup.dest="local" \
+  -l backup.prefix="postgres-backups" \
+  -l backup.retention="7d" \
+  postgres:15
+
+# Run Label Backup
+docker run -d \
+  --name label-backup \
+  -v /var/run/docker.sock:/var/run/docker.sock:ro \
+  -v ./backups:/backups \
+  -e LOCAL_BACKUP_PATH=/backups \
+  -e GLOBAL_RETENTION_PERIOD="30d" \
+  -e LOG_LEVEL="info" \
+  -p 8080:8080 \
+  --network container:postgres-db \
+  resulgg/label-backup
+```
+
 ## Key Features
 
 ### 🔍 **Automatic Discovery**
