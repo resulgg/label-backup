@@ -12,6 +12,8 @@ services:
       - "9001:9001"
     volumes:
       - minio-data:/data
+    networks:
+      - backup_network
 
   mongodb:
     image: mongo:7
@@ -27,6 +29,8 @@ services:
       backup.dest: "s3"
       backup.prefix: "mongodb-backups"
       backup.retention: "7d"
+    networks:
+      - backup_network
 
   label-backup:
     image: resulgg/label-backup
@@ -45,6 +49,12 @@ services:
       - mongodb
     ports:
       - "8080:8080"
+    networks:
+      - backup_network
 
 volumes:
   minio-data:
+
+networks:
+  backup_network:
+    driver: bridge

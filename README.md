@@ -44,6 +44,8 @@ services:
       backup.dest: "local"
       backup.prefix: "postgres-backups"
       backup.retention: "7d"
+    networks:
+      - backup_network
 
   label-backup:
     image: resulgg/label-backup
@@ -58,6 +60,12 @@ services:
       - postgres
     ports:
       - "8080:8080"
+    networks:
+      - backup_network
+
+networks:
+  backup_network:
+    driver: bridge
 ```
 
 ### 2. Run the Stack

@@ -16,6 +16,8 @@ services:
       backup.dest: "s3"
       backup.prefix: "mysql-backups"
       backup.retention: "14d"
+    networks:
+      - backup_network
 
   label-backup:
     image: resulgg/label-backup
@@ -33,3 +35,9 @@ services:
       - mysql
     ports:
       - "8080:8080"
+    networks:
+      - backup_network
+
+networks:
+  backup_network:
+    driver: bridge
