@@ -74,7 +74,7 @@ networks:
 docker-compose up -d
 ```
 
-### 3. Alternative: Using Docker Run
+### Alternative: Using Docker Run
 
 If you prefer using `docker run` instead of Docker Compose:
 
