@@ -79,9 +79,13 @@ docker-compose up -d
 If you prefer using `docker run` instead of Docker Compose:
 
 ```bash
+# Create a custom network
+docker network create backup_network
+
 # Run your database container with labels
 docker run -d \
   --name postgres-db \
+  --network backup_network \
   -e POSTGRES_DB=myapp \
   -e POSTGRES_USER=appuser \
   -e POSTGRES_PASSWORD=apppass \
@@ -97,13 +101,13 @@ docker run -d \
 # Run Label Backup
 docker run -d \
   --name label-backup \
+  --network backup_network \
   -v /var/run/docker.sock:/var/run/docker.sock:ro \
   -v ./backups:/backups \
   -e LOCAL_BACKUP_PATH=/backups \
   -e GLOBAL_RETENTION_PERIOD="30d" \
   -e LOG_LEVEL="info" \
   -p 8080:8080 \
-  --network container:postgres-db \
   resulgg/label-backup
 ```
 
